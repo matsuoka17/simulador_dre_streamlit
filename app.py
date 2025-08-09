@@ -4,7 +4,7 @@ from core.state import init_state
 st.set_page_config(page_title="Simulador DRE (MVP)", page_icon="📊", layout="wide")
 init_state()
 
-st.title("📊 Simulador DRE (MVP)")
+st.title("📊 Simulador P&L")
 st.markdown(
     """
     Este é o *MVP* do simulador de DRE. Navegue pelas páginas à esquerda:
