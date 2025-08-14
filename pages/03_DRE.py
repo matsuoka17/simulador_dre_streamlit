@@ -5,7 +5,7 @@ from datetime import datetime
 from core.state import init_state
 from core.io import load_volume_base
 
-st.set_page_config(page_title="DRE (Template)", page_icon="📈", layout="wide")
+st.set_page_config(page_title="P&L (Template)", page_icon="📈", layout="wide")
 init_state()
 
 st.header("📈 P&L")
