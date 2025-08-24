@@ -1,8 +1,22 @@
-streamlit>=1.37.0
-pandas>=2.2.2
-numpy>=1.26.4
-pydantic>=2.7.0
-xlrd==2.0.1
-openpyxl>=3.1.2
-streamlit-aggrid==1.1.7
-streamlit-aggrid==1.1.7
+# Core do app
+streamlit==1.35.0
+streamlit-aggrid==0.3.4.post3
+
+# Data stack
+pandas>=2.2
+numpy>=1.26
+
+# Parquet
+pyarrow>=15.0
+fastparquet>=2024.5.0
+
+# Excel (leitura/escrita)
+openpyxl>=3.1
+
+# Visualização e análise
+plotly>=5.22
+statsmodels>=0.14
+
+# ML / Otimização
+scikit-learn>=1.4
+pulp>=2.7,<3      # usado no LP da Otimização de Mix (PULP_CBC_CMD)

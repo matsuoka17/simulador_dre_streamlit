@@ -1,840 +1,683 @@
 # pages/02_Volumes.py
 # --------------------------------------------------------------------------------------
-# Módulo: Volumes (Simulador DRE) - Versão Refatorada
-#
-# Melhorias implementadas:
-# - Arquitetura limpa com classes de responsabilidade única
-# - Validação robusta de dados com tratamento de erros
-# - JavaScript modularizado e testável
-# - Sistema de estado simplificado e previsível
-# - Performance otimizada com cache
-# - Logging para debugging
-# - Código maintível e extensível
-#
-# Arquitetura:
-# - VolumeState: Gerencia estado de forma centralizada
-# - VolumeValidator: Validação de dados de entrada
-# - VolumeFormatter: Formatação e parsing de valores
-# - VolumeGrid: Configuração e management dos grids AgGrid
-# - VolumeExporter: Funcionalidades de export
+# Volumes — Realizado (YTD) travado a partir do CURRENT + Projeção (YTG) editável
+# a partir do RES_WORKING. Ocultar YTD, export XLSX, resumo de alterações.
 # --------------------------------------------------------------------------------------
 
-import streamlit as st
-import pandas as pd
-import logging
-from pathlib import Path
+import io
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
-from core.state import init_state
-from core.io import load_volume_base
+from typing import List, Optional, Tuple
 
-# AgGrid
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+import pandas as pd
+import streamlit as st
+from st_aggrid import AgGrid, GridUpdateMode
 from st_aggrid.shared import JsCode
 
-# --------------------------------------------------------------------------------------
-# Setup inicial e logging
-# --------------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Core
+import core.paths as P
+import core.models as M
 
 st.set_page_config(page_title="Volumes", page_icon="🧮", layout="wide")
-init_state()
-
 
 # --------------------------------------------------------------------------------------
-# Classes de domínio e utilitárias
+# Utilitários
 # --------------------------------------------------------------------------------------
-
 @dataclass
-class VolumeChange:
-    """Representa uma alteração de volume"""
-    family: str
-    month: str
-    old_value: int
-    new_value: int
-    year: int
-
-    @property
-    def delta(self) -> int:
-        return self.new_value - self.old_value
-
-    @property
-    def change_type(self) -> str:
-        return "Inclusão" if self.delta > 0 else "Retirada"
-
-
-class VolumeValidator:
-    """Responsável por validar dados de volume"""
-
-    REQUIRED_COLUMNS = ['ano', 'mes', 'volume', 'Família Comercial']
-    VALID_MONTHS = list(range(1, 13))
-
-    @classmethod
-    def validate_dataframe(cls, df: pd.DataFrame) -> None:
-        """Valida estrutura do DataFrame"""
-        if df.empty:
-            raise ValueError("DataFrame está vazio")
-
-        missing_cols = [col for col in cls.REQUIRED_COLUMNS if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"Colunas obrigatórias ausentes: {missing_cols}")
-
-        # Valida tipos e valores
-        if not pd.api.types.is_numeric_dtype(df['ano']):
-            raise ValueError("Coluna 'ano' deve ser numérica")
-
-        invalid_months = df['mes'].dropna().unique()
-        invalid_months = [m for m in invalid_months if m not in cls.VALID_MONTHS]
-        if invalid_months:
-            raise ValueError(f"Meses inválidos encontrados: {invalid_months}")
-
-    @classmethod
-    def sanitize_dataframe(cls, df: pd.DataFrame) -> pd.DataFrame:
-        """Sanitiza e converte tipos do DataFrame"""
-        df = df.copy()
-
-        # Conversões seguras
-        df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
-        df["mes"] = pd.to_numeric(df["mes"], errors="coerce").astype("Int64")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(float)
-
-        # Remove linhas com dados críticos faltando
-        df = df.dropna(subset=['ano', 'mes', 'Família Comercial'])
-
-        return df
-
-
 class VolumeFormatter:
-    """Responsável por formatação e parsing de valores"""
-
-    MONTH_MAP = {
-        1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
-        7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez"
-    }
-
+    MONTH_MAP = M.MONTH_MAP_PT
+    REV_MONTH_MAP = {v: k for k, v in MONTH_MAP.items()}
     SCALE_OPTIONS = {"1x": 1, "1.000x": 1_000, "1.000.000x": 1_000_000}
 
     @classmethod
-    def get_month_columns(cls) -> List[str]:
-        """Retorna lista de colunas de meses"""
+    def month_cols(cls) -> List[str]:
         return [cls.MONTH_MAP[i] for i in range(1, 13)]
 
     @classmethod
-    def get_scale_factor(cls, scale_label: str) -> int:
-        """Retorna fator de escala baseado no label"""
-        return cls.SCALE_OPTIONS.get(scale_label, 1)
+    def get_scale_factor(cls, label: str) -> int:
+        return cls.SCALE_OPTIONS.get(label, 1)
 
     @classmethod
-    def create_value_formatter_js(cls, scale_factor: int) -> JsCode:
-        """Cria formatter JavaScript para valores com escala"""
+    def js_value_formatter(cls, scale_factor: int) -> JsCode:
         if scale_factor == 1:
-            format_body = "return Math.round(val).toLocaleString('pt-BR');"
+            fmt = "return Math.round(val).toLocaleString('pt-BR');"
         else:
-            format_body = "return val.toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});"
-
-        js_code = f"""
+            fmt = "return val.toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});"
+        return JsCode(f"""
         function(params) {{
-            if (params.value === null || params.value === undefined) return '';
-            const val = Number(params.value) / {scale_factor};
-            {format_body}
-        }}
-        """
-        return JsCode(js_code)
+          if (params.value === null || params.value === undefined) return '';
+          const val = Number(params.value) / {scale_factor};
+          {fmt}
+        }}""")
 
     @classmethod
-    def create_value_parser_js(cls, scale_factor: int) -> JsCode:
-        """Cria parser JavaScript para fórmulas Excel-like"""
-        js_code = f"""
-        function(params) {{
-            var rawCurrent = Number((params.oldValue !== undefined ? params.oldValue : params.value) || 0);
-            var input = (params.newValue ?? '').toString().trim();
-            var SCALE = {scale_factor};
+    def js_value_parser(cls, scale_factor: int) -> JsCode:
+        return JsCode(f"""
+        function(params){{
+          var raw = Number((params.oldValue !== undefined ? params.oldValue : params.value) || 0);
+          var input = (params.newValue ?? '').toString().trim();
+          var SCALE = {scale_factor};
+          if (input === '') return raw;
 
-            if (input === '') return rawCurrent;
+          function brToFloat(s){{
+            if (s === null || s === undefined) return NaN;
+            s = String(s).trim();
+            if (!s) return NaN;
+            if (s.indexOf(',') >= 0) s = s.replace(/\\./g,'').replace(/,/g,'.');
+            return parseFloat(s);
+          }}
 
-            // Função para converter formato BR para float
-            function brToFloat(s) {{
-                if (s === null || s === undefined) return NaN;
-                s = String(s).trim();
-                if (s === '') return NaN;
-                if (s.indexOf(',') >= 0) {{
-                    s = s.replace(/\\./g,'').replace(/,/g,'.');
-                }}
-                return parseFloat(s);
-            }}
+          // +10%  /  -5%
+          var m = input.match(/^([+-])\\s*([0-9]+[\\.,]?[0-9]*)\\s*%$/);
+          if (m){{
+            var sign = (m[1] === '+') ? 1 : -1;
+            var pct = brToFloat(m[2]);
+            if (isNaN(pct)) return raw;
+            return Math.max(0, Math.round(raw * (1 + sign * pct/100)));
+          }}
 
-            var m;
+          // +1000  /  -250,5
+          m = input.match(/^([+-])\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
+          if (m){{
+            var sign = (m[1] === '+') ? 1 : -1;
+            var deltaDisp = brToFloat(m[2]);
+            if (isNaN(deltaDisp)) return raw;
+            return Math.max(0, Math.round(raw + sign * deltaDisp * SCALE));
+          }}
 
-            // Percentuais: +10% / -7,5%
-            m = input.match(/^([+-])\\s*([0-9]+[\\.,]?[0-9]*)\\s*%$/);
-            if (m) {{
-                var sign = (m[1] === '+') ? 1 : -1;
-                var pct = brToFloat(m[2]) / 100.0;
-                if (isNaN(pct)) return rawCurrent;
-                var newRaw = Math.round(rawCurrent * (1 + sign * pct));
-                return Math.max(0, newRaw);
-            }}
+          // *1,2
+          m = input.match(/^\\*\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
+          if (m){{
+            var factor = brToFloat(m[1]);
+            if (isNaN(factor)) return raw;
+            return Math.max(0, Math.round(raw * factor));
+          }}
 
-            // Operações aditivas: +N / -N
-            m = input.match(/^([+-])\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
-            if (m) {{
-                var sign = (m[1] === '+') ? 1 : -1;
-                var deltaDisp = brToFloat(m[2]);
-                if (isNaN(deltaDisp)) return rawCurrent;
-                var newRaw = Math.round(rawCurrent + sign * deltaDisp * SCALE);
-                return Math.max(0, newRaw);
-            }}
+          // /2
+          m = input.match(/^\\/\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
+          if (m){{
+            var div = brToFloat(m[1]);
+            if (!div) return raw;
+            return Math.max(0, Math.round(raw / div));
+          }}
 
-            // Multiplicação: *fator
-            m = input.match(/^\\*\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
-            if (m) {{
-                var factor = brToFloat(m[1]);
-                if (isNaN(factor)) return rawCurrent;
-                var newRaw = Math.round(rawCurrent * factor);
-                return Math.max(0, newRaw);
-            }}
+          // expressão livre ou número absoluto
+          var expr = input;
+          if (expr.indexOf(',') >= 0) expr = expr.replace(/\\./g,'').replace(/,/g,'.');
+          if (/[^0-9+\\-*/().\\s]/.test(expr)){{
+            var n = brToFloat(input);
+            if (!isNaN(n)) return Math.max(0, Math.round(n * SCALE));
+            return raw;
+          }}
+          try {{
+            var valDisp = Function('"use strict"; return (' + expr + ')')();
+            if (typeof valDisp !== 'number' || !isFinite(valDisp)) return raw;
+            return Math.max(0, Math.round(valDisp * SCALE));
+          }} catch(e) {{
+            return raw;
+          }}
+        }}""")
 
-            // Divisão: /divisor  
-            m = input.match(/^\\/\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
-            if (m) {{
-                var div = brToFloat(m[1]);
-                if (!div) return rawCurrent;
-                var newRaw = Math.round(rawCurrent / div);
-                return Math.max(0, newRaw);
-            }}
-
-            // Expressão absoluta (sanitizada)
-            var expr = input;
-            if (expr.indexOf(',') >= 0) {{
-                expr = expr.replace(/\\./g,'').replace(/,/g,'.');
-            }}
-
-            // Permite apenas caracteres seguros
-            if (/[^0-9+\\-*/().\\s]/.test(expr)) {{
-                var n = brToFloat(input);
-                if (!isNaN(n)) {{
-                    var newRaw = Math.round(n * SCALE);
-                    return Math.max(0, newRaw);
-                }}
-                return rawCurrent;
-            }}
-
-            try {{
-                var valDisp = Function('"use strict"; return (' + expr + ')')();
-                if (typeof valDisp !== 'number' || !isFinite(valDisp)) return rawCurrent;
-                var newRaw = Math.round(valDisp * SCALE);
-                return Math.max(0, newRaw);
-            }} catch(e) {{
-                return rawCurrent;
-            }}
-        }}
-        """
-        return JsCode(js_code)
-
-
-class VolumeState:
-    """Gerencia o estado dos volumes de forma centralizada"""
-
+class AppState:
     def __init__(self):
-        self._ensure_state_initialized()
+        st.session_state.setdefault("volumes_wide", {})   # {ano: df}
+        st.session_state.setdefault("original_wide", {})  # {ano: df original}
+        st.session_state.setdefault("grid_version", 0)
+        st.session_state.setdefault("hash_map", {})       # {ano: hash}
+        st.session_state.setdefault("del_clicks", 0)
 
-    def _ensure_state_initialized(self):
-        """Garante que o estado está inicializado"""
-        if "volumes_wide" not in st.session_state:
-            st.session_state["volumes_wide"] = {}
-        if "grid_version" not in st.session_state:
-            st.session_state["grid_version"] = 0
-        if "changes_log" not in st.session_state:
-            st.session_state["changes_log"] = {}
+    def get(self, year: int, key: str) -> Optional[pd.DataFrame]:
+        return st.session_state[key].get(year)
 
-    def has_data_for_year(self, year: int) -> bool:
-        """Verifica se há dados para o ano"""
-        return year in st.session_state["volumes_wide"]
+    def set(self, year: int, key: str, df: pd.DataFrame):
+        st.session_state[key][year] = df.copy()
 
-    def get_data_for_year(self, year: int) -> Optional[pd.DataFrame]:
-        """Retorna dados para o ano especificado"""
-        return st.session_state["volumes_wide"].get(year)
+    def set_hash(self, year: int, h: int):
+        st.session_state["hash_map"][year] = h
 
-    def set_data_for_year(self, year: int, data: pd.DataFrame):
-        """Define dados para o ano"""
-        st.session_state["volumes_wide"][year] = data.copy()
-        logger.info(f"Dados atualizados para o ano {year}")
+    def get_hash(self, year: int) -> Optional[int]:
+        return st.session_state["hash_map"].get(year)
 
-    def reset_to_original(self, year: int, original_data: pd.DataFrame):
-        """Reseta dados para valores originais"""
-        self.set_data_for_year(year, original_data)
-        # Limpa log de alterações
-        if year in st.session_state["changes_log"]:
-            del st.session_state["changes_log"][year]
-        self._increment_grid_version()
-        logger.info(f"Dados resetados para valores originais - ano {year}")
-
-    def revert_change(self, year: int, family: str, month: str, original_value: int):
-        """Reverte uma alteração específica"""
-        if not self.has_data_for_year(year):
-            return
-
-        data = self.get_data_for_year(year)
-        mask = data["Família Comercial"] == family
-        if mask.any():
-            data.loc[mask, month] = original_value
-            # Recalcula total
-            month_cols = VolumeFormatter.get_month_columns()
-            data["Total Ano"] = data[month_cols].sum(axis=1).astype(int)
-
-            self.set_data_for_year(year, data)
-            self._remove_from_changes_log(year, family, month)
-            self._increment_grid_version()
-            logger.info(f"Alteração revertida: {family} - {month} = {original_value}")
-
-    def _increment_grid_version(self):
-        """Incrementa versão do grid para forçar remount"""
-        # Limita crescimento da versão
+    def bump(self):
         st.session_state["grid_version"] = (st.session_state["grid_version"] + 1) % 1000
 
-    def get_grid_version(self) -> int:
-        """Retorna versão atual do grid"""
+    def version(self) -> int:
         return st.session_state["grid_version"]
 
-    def _remove_from_changes_log(self, year: int, family: str, month: str):
-        """Remove entrada do log de alterações"""
-        if year not in st.session_state["changes_log"]:
-            return
+# --------------------------------------------------------------------------------------
+# Leitura via models
+# --------------------------------------------------------------------------------------
+FAM_COL_CAND = ["Família Comercial", "Familia Comercial", "familia_comercial", "Familia"]
 
-        key = f"{family}_{month}"
-        if key in st.session_state["changes_log"][year]:
-            del st.session_state["changes_log"][year][key]
+def _fam_col(df: pd.DataFrame) -> str:
+    for c in FAM_COL_CAND:
+        if c in df.columns:
+            return c
+    return "Família Comercial"
 
+@st.cache_data(show_spinner=False)
+def load_current_volume_from_models() -> pd.DataFrame:
+    # Realizado (CURRENT) -> long de volumes
+    df = M.dre_long(
+        cenario_like="Realizado",
+        keep_dims=["Família Comercial", "ano", "mes"]
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["Família Comercial","ano","mes","volume"])
+    sub = df[df["indicador_id"] == "volume_uc"].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=["Família Comercial","ano","mes","volume"])
+    out = (sub.groupby(["Família Comercial","ano","mes"], dropna=False, as_index=False)["valor"]
+              .sum().rename(columns={"valor":"volume"}))
+    out["ano"]    = pd.to_numeric(out["ano"], errors="coerce").astype("Int64")
+    out["mes"]    = pd.to_numeric(out["mes"], errors="coerce").astype("Int64")
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0).astype(float)
+    out["Família Comercial"] = out["Família Comercial"].astype(str).str.strip()
+    return out
 
-class VolumeGrid:
-    """Responsável pela configuração e management dos grids AgGrid"""
+@st.cache_data(show_spinner=False)
+def load_res_volume_from_models() -> pd.DataFrame:
+    # YTG baseline (editável) -> RES_WORKING
+    df = M.res_volume_by_family_long()
+    if df.empty:
+        return pd.DataFrame(columns=["Família Comercial","ano","mes","volume"])
+    df["ano"]    = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+    df["mes"]    = pd.to_numeric(df["mes"], errors="coerce").astype("Int64")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).astype(float)
+    df["Família Comercial"] = df["Família Comercial"].astype(str).str.strip()
+    return df
 
-    @staticmethod
-    def create_row_style_js() -> JsCode:
-        """Cria estilo para linhas do grid"""
-        return JsCode("""
-        function(params) {
-            if (params.node.rowPinned === 'top' || 
-                (params.data && params.data["Família Comercial"] === "TOTAL")) {
-                return {
-                    'backgroundColor': '#374151',
-                    'color': '#F9FAFB', 
-                    'fontWeight': 'bold'
-                };
-            }
-            return null;
+def _latest_year(*dfs: pd.DataFrame) -> Optional[int]:
+    years = []
+    for d in dfs:
+        if d is None or d.empty or "ano" not in d.columns:
+            continue
+        years.extend(pd.to_numeric(d["ano"], errors="coerce").dropna().astype(int).unique().tolist())
+    return max(years) if years else None
+
+def compute_cutoff(df_real: pd.DataFrame, year: int) -> int:
+    d = df_real.loc[df_real["ano"] == year]
+    if d.empty:
+        return 0
+    meses = d.groupby("mes", as_index=False)["volume"].sum()
+    meses_pos = meses.loc[meses["volume"] > 0, "mes"]
+    return int(meses_pos.max()) if not meses_pos.empty else 0
+
+def pivot_year_from_sources(df_real: pd.DataFrame, df_res: pd.DataFrame, year: int) -> Tuple[pd.DataFrame, int]:
+    """
+    Monta grade wide: Realizado (<=cutoff) travado + RES_WORKING (>cutoff) editável.
+    """
+    cutoff = compute_cutoff(df_real, year)
+
+    fams = sorted(
+        set(df_real.loc[df_real["ano"] == year, "Família Comercial"].unique().tolist())
+        | set(df_res.loc[df_res["ano"] == year, "Família Comercial"].unique().tolist())
+    )
+
+    def _pivot(df_src: pd.DataFrame) -> pd.DataFrame:
+        sub = df_src.loc[df_src["ano"] == year, ["Família Comercial", "mes", "volume"]].copy()
+        if sub.empty:
+            return pd.DataFrame(columns=["Família Comercial"] + list(range(1, 13)))
+        p = sub.pivot_table(index="Família Comercial", columns="mes", values="volume", aggfunc="sum").reindex(
+            columns=list(range(1, 13)), fill_value=0
+        )
+        p = p.reindex(fams).fillna(0)
+        p.index.name = "Família Comercial"
+        return p.reset_index()
+
+    piv_real = _pivot(df_real)
+    piv_res  = _pivot(df_res)
+    if piv_res.empty:
+        piv_res = pd.DataFrame({"Família Comercial": fams})
+        for m in range(1, 13):
+            piv_res[m] = 0.0
+
+    final = piv_res.copy()
+    for m in range(1, 13):
+        if m <= cutoff:
+            final[m] = piv_real[m] if m in piv_real.columns else 0.0
+
+    ren = {i: VolumeFormatter.MONTH_MAP[i] for i in range(1, 13)}
+    final = final.rename(columns=ren)
+    month_cols = VolumeFormatter.month_cols()
+    for c in month_cols:
+        final[c] = pd.to_numeric(final[c], errors="coerce").fillna(0).round(0).astype(int)
+    final["Total Ano"] = final[month_cols].sum(axis=1).astype(int)
+
+    return final, cutoff
+
+def df_hash_for_grid(df: pd.DataFrame) -> int:
+    month_cols = VolumeFormatter.month_cols()
+    safe_cols = ["Família Comercial"] + [c for c in month_cols if c in df.columns]
+    h = pd.util.hash_pandas_object(df[safe_cols], index=False).sum()
+    try:
+        return int(h)
+    except Exception:
+        return int(h.astype("int64"))
+
+def calc_changes(original_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+    month_cols = VolumeFormatter.month_cols()
+    orig_idx = original_df.set_index("Família Comercial")[month_cols]
+    curr_idx = current_df.set_index("Família Comercial")[month_cols]
+    fams = orig_idx.index.union(curr_idx.index)
+
+    orig_al = orig_idx.reindex(fams).fillna(0).astype(int)
+    curr_al = curr_idx.reindex(fams).fillna(0).astype(int)
+
+    orig_long = orig_al.reset_index().melt(id_vars=["Família Comercial"], var_name="Mês", value_name="Antes")
+    curr_long = curr_al.reset_index().melt(id_vars=["Família Comercial"], var_name="Mês", value_name="Depois")
+
+    df = orig_long.merge(curr_long, on=["Família Comercial", "Mês"], how="outer").fillna(0)
+    df["Δ"] = (df["Depois"] - df["Antes"]).astype(int)
+    df = df.loc[df["Δ"] != 0].copy()
+    df["Tipo"] = df["Δ"].apply(lambda x: "Inclusão" if x > 0 else "Retirada")
+    return df[["Família Comercial", "Mês", "Tipo", "Antes", "Depois", "Δ"]].copy()
+
+# --------------------------------------------------------------------------------------
+# ColumnDefs (AgGrid)
+# --------------------------------------------------------------------------------------
+def build_coldefs_main(scale_factor: int, cutoff: int, hide_realizados: bool) -> list:
+    val_fmt = VolumeFormatter.js_value_formatter(scale_factor)
+    val_par = VolumeFormatter.js_value_parser(scale_factor)
+
+    def month_col_def(mnum: int) -> dict:
+        name = VolumeFormatter.MONTH_MAP[mnum]
+        return {
+            "field": name,
+            "headerName": name,
+            "type": ["rightAligned", "numericColumn"],
+            "editable": mnum > cutoff,            # Realizado travado
+            "valueFormatter": val_fmt.js_code,
+            "valueParser": val_par.js_code,
+            "sortable": True,
+            "cellStyle": JsCode(
+                f"""
+                function(params){{
+                  const locked = {mnum} <= {cutoff};
+                  if (locked) return {{ backgroundColor: '#F3F4F6', color: '#6B7280' }};
+                  return null;
+                }}"""
+            ).js_code,
+            "hide": (mnum <= cutoff and hide_realizados),
         }
-        """)
 
-    @staticmethod
-    def create_delete_button_js() -> Tuple[JsCode, JsCode, JsCode]:
-        """Cria componentes para botão de deletar"""
-        value_getter = JsCode("function(params){ return '✖'; }")
+    realizado_children = [month_col_def(m) for m in range(1, cutoff + 1)] if cutoff >= 1 else []
+    previsao_children  = [month_col_def(m) for m in range(cutoff + 1, 13)]
 
-        cell_style = JsCode("""
-        function(params){
-            return {
-                display: 'flex',
-                alignItems: 'center', 
-                justifyContent: 'center',
-                backgroundColor: '#DC2626',
-                color: '#FFFFFF',
-                fontWeight: '700',
-                cursor: 'pointer',
-                borderRadius: '4px'
-            };
-        }
-        """)
-
-        click_handler = JsCode("""
-        function(params) {
-            try {
-                if (params.colDef && params.colDef.field === 'Excluir') {
-                    params.node.setDataValue('DELETE_FLAG', 1);
+    coldefs = [
+        {
+            "field": "Família Comercial",
+            "headerName": "Família",
+            "editable": False,
+            "suppressMovable": True,
+            "cellStyle": JsCode("""
+              function(params){
+                if (params.data && (params.data["Família Comercial"] === "TOTAL" ||
+                                    params.data["Família Comercial"] === "Resultado Operacional")){
+                  return {'backgroundColor': '#FFF9C4', 'fontWeight': 'bold'};
                 }
-            } catch (e) {
-                console.error('Erro no click handler:', e);
+                return null;
+              }
+            """).js_code
+        },
+    ]
+
+    if realizado_children:
+        coldefs.append({
+            "headerName": f"Realizado (<= M{cutoff:02d})",
+            "marryChildren": True,
+            "children": realizado_children
+        })
+    if previsao_children:
+        coldefs.append({
+            "headerName": "Previsão (RES)",
+            "marryChildren": True,
+            "children": previsao_children
+        })
+
+    coldefs.append({
+        "field": "Total Ano",
+        "headerName": "Total Ano",
+        "editable": False,
+        "type": ["rightAligned", "numericColumn"],
+        "valueFormatter": val_fmt.js_code,
+        "cellStyle": JsCode("""
+          function(params){
+            if (params.data && (params.data["Família Comercial"] === "TOTAL" ||
+                                params.data["Família Comercial"] === "Resultado Operacional")){
+              return {'backgroundColor': '#FFF9C4', 'fontWeight': 'bold'};
             }
+            return {'fontWeight': '600'};
+          }
+        """).js_code
+    })
+    return coldefs
+
+def build_row_style_main() -> JsCode:
+    return JsCode("""
+      function(params){
+        if (params.node.rowPinned === 'top') {
+          return {'backgroundColor': '#FFF9C4', 'fontWeight': 'bold'};
         }
-        """)
-
-        return value_getter, cell_style, click_handler
-
-    @staticmethod
-    def build_main_grid(data: pd.DataFrame, scale_factor: int, grid_version: int) -> GridOptionsBuilder:
-        """Constrói grid principal de edição"""
-        month_cols = VolumeFormatter.get_month_columns()
-        value_formatter = VolumeFormatter.create_value_formatter_js(scale_factor)
-        value_parser = VolumeFormatter.create_value_parser_js(scale_factor)
-        row_style = VolumeGrid.create_row_style_js()
-
-        # Linha de total
-        totals_dict = {
-            "Família Comercial": "TOTAL",
-            **{col: int(data[col].sum()) for col in month_cols},
-            "Total Ano": int(data["Total Ano"].sum())
+        if (params.data && (params.data["Família Comercial"] === "TOTAL" ||
+                            params.data["Família Comercial"] === "Resultado Operacional")){
+          return {'backgroundColor': '#FFF9C4', 'fontWeight': 'bold'};
         }
+        return null;
+      }
+    """)
 
-        gb = GridOptionsBuilder.from_dataframe(data)
-        gb.configure_column("Família Comercial", header_name="Família", editable=False)
-        gb.configure_column("Total Ano",
-                            type=["rightAligned", "numericColumn"],
-                            valueFormatter=value_formatter,
-                            editable=False)
+def build_gridopts_main(df: pd.DataFrame, coldefs: list, pinned_totals: dict) -> dict:
+    return {
+        "columnDefs": coldefs,
+        "rowHeight": 34,
+        "ensureDomOrder": True,
+        "enableRangeSelection": True,
+        "stopEditingWhenCellsLoseFocus": True,
+        "enterMovesDownAfterEdit": True,
+        "singleClickEdit": True,
+        "suppressColumnMove": True,
+        "pinnedTopRowData": [pinned_totals],
+        "getRowStyle": build_row_style_main().js_code,
+        "defaultColDef": {"resizable": True},
+    }
 
-        for col in month_cols:
-            gb.configure_column(col,
-                                type=["rightAligned", "numericColumn"],
-                                valueFormatter=value_formatter,
-                                valueParser=value_parser,
-                                editable=True)
-
-        gb.configure_grid_options(
-            pinnedTopRowData=[totals_dict],
-            getRowStyle=row_style,
-            rowHeight=34,
-            ensureDomOrder=True,
-            enableRangeSelection=True,
-            stopEditingWhenCellsLoseFocus=True,
-            enterMovesDownAfterEdit=True,
-            singleClickEdit=True,
-        )
-
-        return gb, totals_dict
-
-    @staticmethod
-    def build_changes_grid(changes_df: pd.DataFrame, scale_factor: int) -> GridOptionsBuilder:
-        """Constrói grid de alterações com botão de exclusão"""
-        value_formatter = VolumeFormatter.create_value_formatter_js(scale_factor)
-        del_getter, del_style, del_click = VolumeGrid.create_delete_button_js()
-
-        # Adiciona colunas de controle
-        changes_df = changes_df.copy()
-        changes_df["DELETE_FLAG"] = 0
-        changes_df["Excluir"] = "✖"
-
-        gb = GridOptionsBuilder.from_dataframe(changes_df)
-        gb.configure_column("Família Comercial", header_name="Família", editable=False)
-        gb.configure_column("Mês", editable=False)
-        gb.configure_column("Tipo", editable=False)
-        gb.configure_column("Antes",
-                            type=["rightAligned", "numericColumn"],
-                            valueFormatter=value_formatter,
-                            editable=False)
-        gb.configure_column("Depois",
-                            type=["rightAligned", "numericColumn"],
-                            valueFormatter=value_formatter,
-                            editable=False)
-        gb.configure_column("Δ",
-                            type=["rightAligned", "numericColumn"],
-                            valueFormatter=value_formatter,
-                            editable=False)
-        gb.configure_column("DELETE_FLAG", header_name="", hide=True, editable=False)
-        gb.configure_column("Excluir",
-                            header_name="",
-                            editable=False,
-                            valueGetter=del_getter,
-                            cellStyle=del_style,
-                            width=50,
-                            max_width=60)
-
-        gb.configure_grid_options(
-            rowHeight=36,
-            suppressRowClickSelection=True,
-            stopEditingWhenCellsLoseFocus=True,
-            onCellClicked=del_click
-        )
-
-        return gb
-
-
-class VolumeExporter:
-    """Responsável pelas funcionalidades de export"""
-
-    @staticmethod
-    def create_table_csv(data: pd.DataFrame, year: int) -> bytes:
-        """Cria CSV da tabela principal com linha de total"""
-        month_cols = VolumeFormatter.get_month_columns()
-        export_df = data[["Família Comercial"] + month_cols + ["Total Ano"]].copy()
-
-        # Adiciona linha de total no topo
-        total_row = {
-            "Família Comercial": "TOTAL",
-            **{col: int(export_df[col].sum()) for col in month_cols},
-            "Total Ano": int(export_df["Total Ano"].sum())
-        }
-
-        export_df_final = pd.concat([pd.DataFrame([total_row]), export_df], ignore_index=True)
-        return export_df_final.to_csv(index=False, encoding="utf-8-sig").encode()
-
-    @staticmethod
-    def create_changes_csv(changes_df: pd.DataFrame, year: int) -> bytes:
-        """Cria CSV das alterações"""
-        export_cols = ["Família Comercial", "Mês", "Tipo", "Antes", "Depois", "Δ"]
-        changes_clean = changes_df[export_cols].copy()
-        changes_clean = changes_clean.rename(columns={"Família Comercial": "Familia"})
-        return changes_clean.to_csv(index=False, encoding="utf-8-sig").encode()
-
-
-class VolumeProcessor:
-    """Classe principal que orquestra todo o processamento"""
-
-    def __init__(self):
-        self.state = VolumeState()
-        self.validator = VolumeValidator()
-        self.formatter = VolumeFormatter()
-        self.grid = VolumeGrid()
-        self.exporter = VolumeExporter()
-
-    @st.cache_data
-    def load_and_process_base_data(_self, data_source) -> pd.DataFrame:
-        """Carrega e processa dados base com cache"""
-        try:
-            if isinstance(data_source, (str, Path)):
-                base_df = load_volume_base(data_source)
-            else:
-                base_df = load_volume_base(data_source)
-
-            _self.validator.validate_dataframe(base_df)
-            return _self.validator.sanitize_dataframe(base_df)
-
-        except Exception as e:
-            logger.error(f"Erro ao carregar dados: {e}")
-            raise
-
-    def create_pivot_from_base(self, base_df: pd.DataFrame, year: int) -> pd.DataFrame:
-        """Cria tabela pivot a partir dos dados base"""
-        df_year = base_df.loc[base_df["ano"] == year].copy()
-
-        if df_year.empty:
-            raise ValueError(f"Não há dados para o ano {year}")
-
-        # Agregação e pivot
-        agg_df = df_year.groupby(["Família Comercial", "mes"], as_index=False)["volume"].sum()
-        pivot_df = (
-            agg_df.pivot(index="Família Comercial", columns="mes", values="volume")
-            .reindex(columns=list(range(1, 13)), fill_value=0)
-            .fillna(0)
-        )
-
-        # Renomeia colunas para nomes dos meses
-        pivot_df.columns = [self.formatter.MONTH_MAP[col] for col in pivot_df.columns]
-        pivot_df = pivot_df.reset_index()
-
-        # Converte para inteiros e adiciona total
-        month_cols = self.formatter.get_month_columns()
-        for col in month_cols:
-            pivot_df[col] = pd.to_numeric(pivot_df[col], errors="coerce").fillna(0).round(0).astype(int)
-
-        pivot_df["Total Ano"] = pivot_df[month_cols].sum(axis=1).astype(int)
-
-        return pivot_df
-
-    def calculate_changes(self, original_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
-        """Calcula alterações entre dados originais e atuais"""
-        month_cols = self.formatter.get_month_columns()
-
-        # Prepara dados para comparação
-        orig_idx = original_df.set_index("Família Comercial")[month_cols]
-        curr_idx = current_df.set_index("Família Comercial")[month_cols]
-
-        all_families = orig_idx.index.union(curr_idx.index)
-        orig_aligned = orig_idx.reindex(all_families).fillna(0).astype(int)
-        curr_aligned = curr_idx.reindex(all_families).fillna(0).astype(int)
-
-        # Converte para formato long e merge
-        orig_long = orig_aligned.reset_index().melt(
-            id_vars=["Família Comercial"],
-            var_name="Mês",
-            value_name="Antes"
-        )
-        curr_long = curr_aligned.reset_index().melt(
-            id_vars=["Família Comercial"],
-            var_name="Mês",
-            value_name="Depois"
-        )
-
-        changes_df = orig_long.merge(curr_long, on=["Família Comercial", "Mês"], how="outer").fillna(0)
-        changes_df["Δ"] = (changes_df["Depois"] - changes_df["Antes"]).astype(int)
-        changes_df = changes_df.loc[changes_df["Δ"] != 0].copy()
-        changes_df["Tipo"] = changes_df["Δ"].apply(lambda x: "Inclusão" if x > 0 else "Retirada")
-
-        return changes_df[["Família Comercial", "Mês", "Tipo", "Antes", "Depois", "Δ"]].copy()
-
+def build_gridopts_changes(changes_df: pd.DataFrame, scale_factor: int) -> dict:
+    val_fmt = VolumeFormatter.js_value_formatter(scale_factor)
+    coldefs = [
+        {"field": "Família Comercial", "headerName": "Família", "editable": False},
+        {"field": "Mês", "editable": False},
+        {"field": "Tipo", "editable": False},
+        {"field": "Antes", "type": ["rightAligned", "numericColumn"], "valueFormatter": val_fmt.js_code, "editable": False},
+        {"field": "Depois", "type": ["rightAligned", "numericColumn"], "valueFormatter": val_fmt.js_code, "editable": False},
+        {"field": "Δ", "type": ["rightAligned", "numericColumn"], "valueFormatter": val_fmt.js_code, "editable": False},
+        {"field": "DELETE_FLAG", "hide": True},
+        {
+            "field": "Excluir",
+            "headerName": "",
+            "editable": False,
+            "width": 60,
+            "maxWidth": 70,
+            "valueGetter": JsCode("function(){return '✖';}").js_code,
+            "cellStyle": JsCode("""
+              function(){ return {
+                display: 'flex', alignItems:'center', justifyContent:'center',
+                backgroundColor:'#DC2626', color:'#FFFFFF', fontWeight:'700',
+                cursor:'pointer', borderRadius:'4px'
+              }; }
+            """).js_code,
+        },
+    ]
+    return {
+        "columnDefs": coldefs,
+        "rowHeight": 36,
+        "suppressRowClickSelection": True,
+        "stopEditingWhenCellsLoseFocus": True,
+        "onCellClicked": JsCode("""
+          function(params){
+            try{
+              if (params.colDef && params.colDef.field === 'Excluir'){
+                params.node.setDataValue('DELETE_FLAG', 1);
+              }
+            }catch(e){}
+          }
+        """).js_code,
+        "defaultColDef": {"resizable": True},
+    }
 
 # --------------------------------------------------------------------------------------
-# Interface principal
+# Export XLSX
 # --------------------------------------------------------------------------------------
+def export_visible_to_xlsx(df_display: pd.DataFrame, visible_months: List[str]) -> bytes:
+    cols = ["Família Comercial"] + visible_months + ["Total Ano"]
+    to_export = df_display[cols].copy()
 
+    total_row = {"Família Comercial": "TOTAL", **{c: int(to_export[c].sum()) for c in visible_months}, "Total Ano": int(to_export["Total Ano"].sum())}
+    out = pd.concat([pd.DataFrame([total_row]), to_export], ignore_index=True)
+
+    bio = io.BytesIO()
+    try:
+        with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+            out.to_excel(xw, sheet_name="Volumes", index=False)
+            ws = xw.sheets["Volumes"]
+            for i, col in enumerate(out.columns):
+                maxlen = max(12, out[col].astype(str).map(len).max() if not out.empty else 12)
+                ws.set_column(i, i, min(maxlen + 2, 40))
+    except Exception:
+        with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+            out.to_excel(xw, sheet_name="Volumes", index=False)
+            ws = xw.sheets["Volumes"]
+            from openpyxl.utils import get_column_letter
+            for i, col in enumerate(out.columns, start=1):
+                maxlen = max(12, out[col].astype(str).map(len).max() if not out.empty else 12)
+                ws.column_dimensions[get_column_letter(i)].width = min(maxlen + 2, 40)
+    return bio.getvalue()
+
+# --------------------------------------------------------------------------------------
+# App
+# --------------------------------------------------------------------------------------
 def main():
-    """Função principal da aplicação"""
-    processor = VolumeProcessor()
+    st.header("🧮 Volumes por Família — Realizado + Projeção (RES)")
 
-    st.header("🧮 Volumes por Família — meses em colunas + TOTAL no topo")
+    # ---------------- Sidebar (Controles universais) ----------------
+    with st.sidebar:
+        st.subheader("Controles")
+        valid = P.validate_project_structure()
+        if not valid["parquet_dir"]:
+            st.error("Pasta `data/parquet/` não encontrada.")
+        if not valid["current_parquet"]:
+            st.error("`data/parquet/current.parquet` não encontrado.")
+        if not valid["res_working_parquet"]:
+            st.warning("`data/parquet/res_working.parquet` ausente — baseline YTG (RES) ficará vazia.")
 
-    # Carregamento de dados com tratamento robusto de erros
-    try:
-        data_path = Path("data/base_final_longo_para_modelo.xlsx")
+        escala_label = st.selectbox("Escala", options=list(VolumeFormatter.SCALE_OPTIONS.keys()), index=0)
+        hide_realizados = st.checkbox("Ocultar YTD (Realizado)", value=False)
 
-        if not data_path.exists():
-            st.warning("Base de volumes não encontrada. Faça o upload abaixo.")
-            uploaded_file = st.file_uploader(
-                "Enviar base de volumes (.xlsx)",
-                type=["xlsx"],
-                accept_multiple_files=False,
-                key="upload_volumes"
-            )
+        st.divider()
+        st.caption("Ações sobre a grade:")
+        colA, colB = st.columns(2)
+        with colA:
+            reset_btn = st.button("Recarregar Base", use_container_width=True)
+        with colB:
+            limpar_btn = st.button("Zerar Projeções (YTG)", use_container_width=True)
 
-            if uploaded_file is None:
-                st.info("Coloque o arquivo na pasta 'data/' com o nome 'base_final_longo_para_modelo.xlsx'")
-                st.stop()
+    # ---------------- Dados base ----------------
+    df_real = load_current_volume_from_models()    # YTD do CURRENT
+    df_res  = load_res_volume_from_models()        # YTG baseline do RES_WORKING
 
-            base_df = processor.load_and_process_base_data(uploaded_file)
+    if (df_real.empty and df_res.empty):
+        st.error("Sem dados de volumes em CURRENT/RES_WORKING.")
+        st.stop()
+
+    year = _latest_year(df_real, df_res)
+    if year is None:
+        st.error("Não foi possível detectar o ano.")
+        st.stop()
+
+    st.caption(f"Ano detectado: **{year}** (último ano com dados)")
+
+    scale = VolumeFormatter.get_scale_factor(escala_label)
+    state = AppState()
+
+    original, cutoff = pivot_year_from_sources(df_real, df_res, year)
+
+    # Init/Reset
+    if (state.get(year, "original_wide") is None) or reset_btn:
+        state.set(year, "original_wide", original)
+    if (state.get(year, "volumes_wide") is None) or reset_btn or limpar_btn:
+        base = original.copy()
+        if limpar_btn and cutoff < 12:
+            # Zera somente YTG quando limpar projeções
+            month_cols = VolumeFormatter.month_cols()
+            for m in range(cutoff + 1, 13):
+                col = VolumeFormatter.MONTH_MAP[m]
+                if col in base.columns:
+                    base[col] = 0
+            base["Total Ano"] = base[month_cols].sum(axis=1).astype(int)
+        state.set(year, "volumes_wide", base)
+        state.set_hash(year, df_hash_for_grid(base))
+        state.bump()
+
+    current = state.get(year, "volumes_wide").copy()
+
+    # --- Total YTG (quando Ocultar YTD) ---
+    ytg_months = [VolumeFormatter.MONTH_MAP[m] for m in range(cutoff + 1, 13)
+                  if VolumeFormatter.MONTH_MAP[m] in current.columns]
+    if hide_realizados:
+        if ytg_months:
+            current["Total YTG"] = current[ytg_months].sum(axis=1, numeric_only=True).fillna(0).astype(int)
         else:
-            base_df = processor.load_and_process_base_data(data_path)
+            current["Total YTG"] = 0
+    else:
+        if "Total YTG" in current.columns:
+            current = current.drop(columns=["Total YTG"])
 
-    except Exception as e:
-        st.error(f"Erro ao carregar dados: {str(e)}")
-        st.stop()
+    # Cabeçalhos com totais dos grupos
+    real_months = [VolumeFormatter.MONTH_MAP[m] for m in range(1, cutoff + 1)
+                   if VolumeFormatter.MONTH_MAP[m] in current.columns]
+    prev_months = [VolumeFormatter.MONTH_MAP[m] for m in range(cutoff + 1, 13)
+                   if VolumeFormatter.MONTH_MAP[m] in current.columns]
 
-    # Extrai anos disponíveis
-    anos_disponiveis = sorted([int(ano) for ano in base_df["ano"].dropna().unique()])
-    if not anos_disponiveis:
-        st.error("Nenhum ano válido encontrado nos dados.")
-        st.stop()
+    def _fmt_total_header(val: float, scale_factor: int) -> str:
+        disp = float(val) / (scale_factor if scale_factor else 1)
+        if scale_factor == 1:
+            s = f"{int(round(disp)):,}".replace(",", ".")
+        else:
+            s = f"{disp:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return s
 
-    # Interface de filtros
-    col1, col2, _ = st.columns([1, 1.2, 5])
+    real_total = current[real_months].sum(numeric_only=True).sum() if real_months else 0.0
+    prev_total = current[prev_months].sum(numeric_only=True).sum() if prev_months else 0.0
 
-    with col1:
-        ano_selecionado = st.selectbox(
-            "Ano",
-            options=anos_disponiveis,
-            index=len(anos_disponiveis) - 1,
-            help="Selecione o ano para editar os volumes"
-        )
+    coldefs = build_coldefs_main(scale, cutoff, hide_realizados)
+    for grp in coldefs:
+        if isinstance(grp, dict) and "children" in grp:
+            title = grp.get("headerName", "")
+            if title.startswith("Realizado"):
+                grp["headerName"] = f"{title} — {_fmt_total_header(real_total, scale)}"
+            elif title.startswith("Previsão"):
+                grp["headerName"] = f"{title} — {_fmt_total_header(prev_total, scale)}"
 
-    with col2:
-        escala_label = st.selectbox(
-            "Escala de exibição",
-            options=["1x", "1.000x", "1.000.000x"],
-            index=0
-        )
+    # Pinned totals
+    month_cols = VolumeFormatter.month_cols()
+    pinned_totals = {
+        "Família Comercial": "TOTAL",
+        **{c: int(current[c].sum()) for c in month_cols if c in current.columns},
+        **({"Total YTG": int(current["Total YTG"].sum())} if "Total YTG" in current.columns else {}),
+        "Total Ano": int(current["Total Ano"].sum()),
+    }
+    gridopts = build_gridopts_main(current, coldefs, pinned_totals)
 
-    scale_factor = processor.formatter.get_scale_factor(escala_label)
+    # Força reinit do grid quando variáveis-chave mudarem
+    main_grid_key = f"main_grid_v{state.version()}_{st.session_state['del_clicks']}_{scale}_{cutoff}_{int(hide_realizados)}"
 
-    # Processa dados para o ano selecionado
+    grid_resp = AgGrid(
+        current,
+        gridOptions=gridopts,
+        data_return_mode="AS_INPUT",
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        fit_columns_on_grid_load=True,
+        allow_unsafe_jscode=True,
+        theme="balham",
+        height=520,
+        key=main_grid_key,
+    )
+
+    # aplica edições e recalcula total
     try:
-        original_pivot = processor.create_pivot_from_base(base_df, ano_selecionado)
-    except ValueError as e:
-        st.warning(str(e))
-        st.stop()
+        edited = pd.DataFrame(grid_resp["data"]).copy()
+        for c in month_cols:
+            if c in edited.columns:
+                edited[c] = pd.to_numeric(edited[c], errors="coerce").fillna(0).round(0).astype(int)
+        edited["Total Ano"] = edited[month_cols].sum(axis=1).astype(int)
 
-    # Gerencia estado dos dados editáveis
-    if not processor.state.has_data_for_year(ano_selecionado):
-        processor.state.set_data_for_year(ano_selecionado, original_pivot)
+        # Recalcular Total YTG após edição
+        ytg_months = [VolumeFormatter.MONTH_MAP[m] for m in range(cutoff + 1, 13)
+                      if VolumeFormatter.MONTH_MAP[m] in edited.columns]
+        if hide_realizados:
+            if ytg_months:
+                edited["Total YTG"] = edited[ytg_months].sum(axis=1, numeric_only=True).fillna(0).astype(int)
+            else:
+                edited["Total YTG"] = 0
+        else:
+            if "Total YTG" in edited.columns:
+                edited = edited.drop(columns=["Total YTG"])
 
-    current_data = processor.state.get_data_for_year(ano_selecionado)
+        new_hash = df_hash_for_grid(edited)
+        old_hash = state.get_hash(year)
+        if (old_hash is None) or (new_hash != old_hash):
+            state.set(year, "volumes_wide", edited)
+            state.set_hash(year, new_hash)
+            state.bump()
+            st.rerun()
+    except Exception:
+        pass
 
-    # Toolbar com ações
-    toolbar = st.container()
+    current = state.get(year, "volumes_wide").copy()
+    original = state.get(year, "original_wide").copy()
 
-    # Grid principal de edição
-    try:
-        gb_main, totals_dict = processor.grid.build_main_grid(
-            current_data,
-            scale_factor,
-            processor.state.get_grid_version()
-        )
+    # ---------------- Resumo/Alterações ----------------
+    st.markdown("### 🔁 Alterações aplicadas (vs base carregada)")
+    changes = calc_changes(original, current)
+    if changes.empty:
+        st.info("Nenhuma alteração em relação à base original.")
+    else:
+        changes = changes.copy()
+        changes["DELETE_FLAG"] = 0
+        changes["Excluir"] = "✖"
 
-        grid_response = AgGrid(
-            current_data,
-            gridOptions=gb_main.build(),
+        ch_opts = build_gridopts_changes(changes, scale)
+        ch_resp = AgGrid(
+            changes,
+            gridOptions=ch_opts,
             data_return_mode="AS_INPUT",
             update_mode=GridUpdateMode.MODEL_CHANGED,
             fit_columns_on_grid_load=True,
             allow_unsafe_jscode=True,
             theme="balham",
-            height=520,
-            key=f"main_grid_v{processor.state.get_grid_version()}"
+            height=360,
+            key=f"changes_grid_v{state.version()}_{st.session_state['del_clicks']}"
         )
 
-        st.caption("💡 Dica: digite fórmulas na célula (ex.: -350, +10%, *1,2, 1000-350). Confirme com Enter.")
+        try:
+            ch_after = pd.DataFrame(ch_resp["data"])
+            to_del = ch_after.loc[ch_after.get("DELETE_FLAG", 0) == 1]
+            if not to_del.empty:
+                work = current.copy()
+                base = original.set_index("Família Comercial")
+                for _, row in to_del.iterrows():
+                    fam = row["Família Comercial"]
+                    m   = row["Mês"]
+                    if fam in base.index and m in base.columns:
+                        val = int(base.loc[fam, m])
+                        work.loc[work["Família Comercial"] == fam, m] = val
+                work["Total Ano"] = work[month_cols].sum(axis=1).astype(int)
+                state.set(year, "volumes_wide", work)
+                state.set_hash(year, df_hash_for_grid(work))
+                st.session_state["del_clicks"] += 1
+                state.bump()
+                st.rerun()
+        except Exception:
+            pass
 
-    except Exception as e:
-        st.error(f"Erro ao renderizar grid principal: {str(e)}")
-        logger.error(f"Erro no grid principal: {e}")
-        st.stop()
+    # ---------------- Export XLSX ----------------
+    st.markdown("### 💾 Exportar")
+    visibles = []
+    for m in range(1, 13):
+        name = VolumeFormatter.MONTH_MAP[m]
+        if not (m <= cutoff and hide_realizados):
+            visibles.append(name)
 
-    # Processa dados editados
-    try:
-        edited_data = pd.DataFrame(grid_response["data"]).copy()
-        month_cols = processor.formatter.get_month_columns()
+    xlsx_bytes = export_visible_to_xlsx(current, visibles)
+    st.download_button(
+        label="⬇️ Baixar .xlsx",
+        data=xlsx_bytes,
+        file_name=f"volumes_{year}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-        # Sanitiza dados editados
-        for col in month_cols:
-            edited_data[col] = pd.to_numeric(edited_data[col], errors="coerce").fillna(0).round(0).astype(int)
-
-        edited_data["Total Ano"] = edited_data[month_cols].sum(axis=1).astype(int)
-        processor.state.set_data_for_year(ano_selecionado, edited_data)
-
-        # Cria versão long para DRE
-        long_df = edited_data[["Família Comercial"] + month_cols].melt(
-            id_vars=["Família Comercial"],
-            var_name="mes_nome",
-            value_name="volume"
-        )
-        month_reverse_map = {v: k for k, v in processor.formatter.MONTH_MAP.items()}
-        long_df["mes"] = long_df["mes_nome"].map(month_reverse_map).astype(int)
-        long_df["ano"] = ano_selecionado
-        long_df = long_df.drop(columns=["mes_nome"]).sort_values(["Família Comercial", "mes"])
-
-        st.session_state["volumes_edit"] = long_df.reset_index(drop=True)
-
-    except Exception as e:
-        st.error(f"Erro ao processar dados editados: {str(e)}")
-        logger.error(f"Erro processamento dados editados: {e}")
-
-    # Calcula dados para export
-    try:
-        current_state_data = processor.state.get_data_for_year(ano_selecionado)
-        csv_table_bytes = processor.exporter.create_table_csv(current_state_data, ano_selecionado)
-
-    except Exception as e:
-        st.error(f"Erro ao preparar export: {str(e)}")
-        logger.error(f"Erro no export: {e}")
-        csv_table_bytes = b""
-
-    # Toolbar com botões de ação
-    with toolbar:
-        col1, col2, col3, _ = st.columns([1, 1.8, 2, 5])
-
-        if col1.button("↩️ Retornar original", key="btn_reset"):
-            st.session_state["ask_reset"] = True
-
-        col2.download_button(
-            "💾 Salvar tabela (CSV)",
-            data=csv_table_bytes,
-            file_name=f"tabela_volumes_{ano_selecionado}.csv",
-            mime="text/csv",
-            disabled=len(csv_table_bytes) == 0
-        )
-
-        col3.info(f"Escala aplicada: {escala_label}")
-
-    # Modal de confirmação para reset
-    if st.session_state.get("ask_reset", False):
-        with st.container():
-            st.warning("⚠️ Você quer salvar a simulação atual antes de retornar aos valores originais?")
-
-            col1, col2, col3 = st.columns([2, 1, 1])
-
-            col1.download_button(
-                "⬇️ Salvar simulação atual (CSV)",
-                data=csv_table_bytes,
-                file_name=f"simulacao_{ano_selecionado}.csv",
-                mime="text/csv",
-                disabled=len(csv_table_bytes) == 0
-            )
-
-            if col2.button("✅ Confirmar retorno", key="confirm_reset"):
-                try:
-                    processor.state.reset_to_original(ano_selecionado, original_pivot)
-                    st.session_state["ask_reset"] = False
-                    st.success("✅ Dados retornados aos valores originais!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao resetar dados: {str(e)}")
-                    logger.error(f"Erro no reset: {e}")
-
-            if col3.button("❌ Cancelar", key="cancel_reset"):
-                st.session_state["ask_reset"] = False
-                st.info("Ação cancelada.")
-
-    # Exibe total do ano
-    try:
-        total_ano = int(current_state_data["Total Ano"].sum())
-        st.success(f"📊 Volumes atualizados para {ano_selecionado}. Total do ano: {total_ano:,}".replace(",", "."))
-    except Exception as e:
-        logger.error(f"Erro ao calcular total do ano: {e}")
-        st.warning("Erro ao calcular total do ano")
-
-    # --------------------------------------------------------------------------------------
-    # Tabela "De → Para" com alterações
-    # --------------------------------------------------------------------------------------
-    st.markdown("### 🔁 De → Para (alterações vs base do ano selecionado)")
-
-    try:
-        changes_df = processor.calculate_changes(original_pivot, current_state_data)
-
-        if changes_df.empty:
-            st.info("ℹ️ Nenhuma alteração em relação à base do Excel para o ano selecionado.")
-        else:
-            # Configura grid de alterações
-            gb_changes = processor.grid.build_changes_grid(changes_df, scale_factor)
-
-            changes_response = AgGrid(
-                changes_df,
-                gridOptions=gb_changes.build(),
-                data_return_mode="AS_INPUT",
-                update_mode=GridUpdateMode.MODEL_CHANGED,
-                fit_columns_on_grid_load=True,
-                allow_unsafe_jscode=True,
-                theme="balham",
-                height=380,
-                key=f"changes_grid_v{processor.state.get_grid_version()}"
-            )
-
-            # Processa exclusões de alterações
-            try:
-                changes_after = pd.DataFrame(changes_response["data"])
-                deletions = changes_after.loc[changes_after.get("DELETE_FLAG", 0) == 1]
-
-                if not deletions.empty:
-                    for _, row in deletions.iterrows():
-                        family = row["Família Comercial"]
-                        month = row["Mês"]
-                        original_value = int(row["Antes"])
-
-                        processor.state.revert_change(ano_selecionado, family, month, original_value)
-
-                    st.success(f"✅ {len(deletions)} alteração(ões) revertida(s)!")
-                    st.rerun()
-
-            except Exception as e:
-                logger.error(f"Erro ao processar exclusões: {e}")
-                st.error("Erro ao processar exclusões de alterações")
-
-            # Export das alterações
-            try:
-                csv_changes = processor.exporter.create_changes_csv(changes_df, ano_selecionado)
-                st.download_button(
-                    "⬇️ Baixar alterações (CSV)",
-                    data=csv_changes,
-                    file_name=f"movimentacoes_{ano_selecionado}.csv",
-                    mime="text/csv"
-                )
-            except Exception as e:
-                logger.error(f"Erro ao exportar alterações: {e}")
-                st.warning("Erro ao preparar export das alterações")
-
-    except Exception as e:
-        st.error(f"Erro ao calcular alterações: {str(e)}")
-        logger.error(f"Erro no cálculo de alterações: {e}")
-
+    st.markdown("---")
+    st.caption("YTD (Realizado) vem do CURRENT; YTG (Projeção) parte de RES_WORKING e é editável no grid.")
 
 # --------------------------------------------------------------------------------------
-# Ponto de entrada
-# --------------------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        st.error(f"Erro crítico na aplicação: {str(e)}")
-        logger.critical(f"Erro crítico: {e}")
-
-        # Em desenvolvimento, mostra o traceback completo
-        if st.secrets.get("DEBUG", False):
-            st.exception(e)
+    main()
