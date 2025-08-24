@@ -17,6 +17,19 @@ from st_aggrid.shared import JsCode
 import core.paths as P
 import core.models as M
 
+from core.fs_utils import read_parquet_first_found, debug_parquet_status
+debug_parquet_status()
+
+df_current = read_parquet_first_found([
+    "data/parquet/current.parquet",
+    "data/current.parquet",
+])
+df_res = read_parquet_first_found([
+    "data/parquet/res_working.parquet",
+    "data/res_working.parquet",
+])
+
+
 st.set_page_config(page_title="Volumes", page_icon="🧮", layout="wide")
 
 # --------------------------------------------------------------------------------------

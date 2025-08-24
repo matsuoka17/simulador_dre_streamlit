@@ -20,3 +20,6 @@ statsmodels>=0.14
 # ML / Otimização
 scikit-learn>=1.4
 pulp>=2.7,<3      # usado no LP da Otimização de Mix (PULP_CBC_CMD)
+
+# Outros utilitários usados no projeto
+python-dateutil>=2.9
