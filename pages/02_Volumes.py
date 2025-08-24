@@ -16,8 +16,12 @@ from st_aggrid.shared import JsCode
 # Core
 import core.paths as P
 import core.models as M
-
 from core.fs_utils import read_parquet_first_found, debug_parquet_status
+
+# ⬇️ tem que vir ANTES de qualquer uso de st.*
+st.set_page_config(page_title="Volumes", page_icon="🧮", layout="wide")
+
+# (agora pode usar st.* à vontade)
 debug_parquet_status()
 
 df_current = read_parquet_first_found([
@@ -28,10 +32,6 @@ df_res = read_parquet_first_found([
     "data/parquet/res_working.parquet",
     "data/res_working.parquet",
 ])
-
-
-st.set_page_config(page_title="Volumes", page_icon="🧮", layout="wide")
-
 # --------------------------------------------------------------------------------------
 # Utilitários
 # --------------------------------------------------------------------------------------
