@@ -1,0 +1,24 @@
+{
+  "file": "C:\\Desktop\\simulador_dre_streamlit_v3\\simulador_dre_streamlit\\data\\parquet\\res_working.parquet",
+  "row_count": 125,
+  "schema": {
+    "Família Comercial": "object",
+    "Tecnologia": "string",
+    "ano": "Int64",
+    "mes": "Int64",
+    "volume": "float64"
+  },
+  "generated_at": "2025-08-22T12:05:09",
+  "anos": [
+    2025
+  ],
+  "mes_min": 8,
+  "mes_max": 12,
+  "familias_distintas": 25,
+  "dataset": "res_working",
+  "pipeline": "etl_projecao",
+  "sources": [
+    "C:\\Desktop\\simulador_dre_streamlit_v3\\simulador_dre_streamlit\\data\\res\\working_re_volumes.xlsx"
+  ],
+  "sheet": "(first/active)"
+}

@@ -1,0 +1,52 @@
+{
+  "file": "C:\\Desktop\\simulador_dre_streamlit_v3\\simulador_dre_streamlit\\data\\parquet\\current.parquet",
+  "row_count": 2847,
+  "schema": {
+    "SKU": "object",
+    "Tecnologia": "string",
+    "produto_descricao": "object",
+    "sistema": "object",
+    "cenario": "object",
+    "ano": "Int64",
+    "mes": "Int64",
+    "volume_uc": "float64",
+    "volume_sellout": "float64",
+    "receita_bruta": "float64",
+    "receita_liquida": "float64",
+    "convenio_impostos": "float64",
+    "charge_back": "float64",
+    "insumos": "float64",
+    "resultado_operacional": "float64",
+    "custos_toll_packer": "float64",
+    "fretes_t1": "float64",
+    "estrutura_industrial_variavel": "float64",
+    "custos_variaveis": "float64",
+    "margem_variavel": "float64",
+    "estrutura_industrial_fixa": "float64",
+    "margem_bruta": "float64",
+    "custos_log_t1_reg": "float64",
+    "despesas_secundarias_t2": "float64",
+    "perdas": "float64",
+    "margem_contribuicao": "float64",
+    "dme": "float64",
+    "margem_contribuicao_liquida": "float64",
+    "opex_leao_reg": "float64",
+    "depreciacao": "float64",
+    "ebitda": "float64",
+    "Família Comercial": "object"
+  },
+  "generated_at": "2025-08-22T12:05:09",
+  "anos": [
+    2025
+  ],
+  "mes_min": 1,
+  "mes_max": 12,
+  "familias_distintas": 29,
+  "cenarios_distintos": 3,
+  "dataset": "current",
+  "pipeline": "etl_realizado",
+  "sources": [
+    "C:\\Desktop\\simulador_dre_streamlit_v3\\simulador_dre_streamlit\\data\\realizado\\77e38215f342498f89ed7d6e7d3772e2.xls"
+  ],
+  "sheet": "(first/active)"
+}
