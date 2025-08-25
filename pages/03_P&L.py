@@ -1,8 +1,8 @@
 # pages/03_DRE.py
 # --------------------------------------------------------------------------------------
 # DRE (Parquet) — 2 abas no MESMO arquivo:
-#   1) P&L Mensal (a visão que você já usa — intacta)
-#   2) BP25 vs FY (YTD+YTG) — 5 colunas (Linha, BP, FY, Δ Abs, Δ %)
+#   1) P&L Mensal (com UC por mês, UC (Visão), UC (Ano) e Total Visão quando subset)
+#   2) BP25 vs FY (YTD+YTG) — 5 colunas (Linha, BP, FY, Δ Abs, Δ %), sem barra de rolagem (autoHeight)
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from io import BytesIO
 import re
+import sys
 
 import numpy as np
 import pandas as pd
@@ -23,8 +24,8 @@ from core.fs_utils import read_parquet_first_found, debug_parquet_status
 # ⬇️ SEMPRE antes do primeiro st.*
 st.set_page_config(page_title="DRE", page_icon="📊", layout="wide")
 
-# (depois do page_config pode chamar helpers com st)
-debug_parquet_status()
+# Diagnóstico foi movido para o rodapé (não chamar aqui)
+# debug_parquet_status()
 
 df_current = read_parquet_first_found([
     "data/parquet/current.parquet",
@@ -45,14 +46,31 @@ from core.models import (
     res_volume_by_family_long,
     res_volume_total_by_month,
 )
+
+# --- Imports robustos para calculator e sim ---
 try:
-    from core.calculator import build_simulado_pivot
-except Exception:  # fallback quando executar fora do package root
-    from simulador_dre_streamlit.core.calculator import build_simulado_pivot
-import core.sim as S  # chaves de sessão globais (toggle/escala)
+    from core.calculator import build_simulado_pivot  # type: ignore
+except (ImportError, ModuleNotFoundError):
+    try:
+        from simulador_dre_streamlit.core.calculator import build_simulado_pivot  # type: ignore
+    except (ImportError, ModuleNotFoundError):
+        _root = Path(__file__).resolve().parents[1]
+        if str(_root) not in sys.path:
+            sys.path.insert(0, str(_root))
+        from core.calculator import build_simulado_pivot  # type: ignore
+
+try:
+    import core.sim as S  # type: ignore
+except (ImportError, ModuleNotFoundError):
+    try:
+        import simulador_dre_streamlit.core.sim as S  # type: ignore
+    except (ImportError, ModuleNotFoundError):
+        _root = Path(__file__).resolve().parents[1]
+        if str(_root) not in sys.path:
+            sys.path.insert(0, str(_root))
+        import core.sim as S  # type: ignore
 
 # ---------------- Helpers locais para volumes UI (wide -> long) ----------------
-# Use a tabela oficial de meses do projeto (MONTHS_PT) para mapear cabeçalhos 'jan..dez'
 MONTHS_LOWER: Dict[str, Tuple[int, str]] = {name.lower(): (m, name) for m, name in MONTHS_PT.items()}
 FAM_COL_CAND = ["Família Comercial", "Familia Comercial", "familia_comercial", "Familia"]
 
@@ -60,7 +78,6 @@ def _fam_col_local(df: pd.DataFrame) -> str:
     for c in FAM_COL_CAND:
         if c in df.columns:
             return c
-    # fallback conservador
     return "Família Comercial" if "Família Comercial" in df.columns else df.columns[0]
 
 def get_volumes_from_ui_long(year: int) -> Optional[pd.DataFrame]:
@@ -74,7 +91,6 @@ def get_volumes_from_ui_long(year: int) -> Optional[pd.DataFrame]:
     if isinstance(vw, dict) and year in vw and isinstance(vw[year], pd.DataFrame):
         dfw = vw[year].copy()
         fam_col = _fam_col_local(dfw)
-        # mapeia possíveis variações de cabeçalho de mês (case-insensitive)
         month_idx: Dict[int, str] = {}
         for c in dfw.columns:
             lc = str(c).strip().lower()
@@ -92,7 +108,6 @@ def get_volumes_from_ui_long(year: int) -> Optional[pd.DataFrame]:
             })
             rows.append(row)
         return pd.concat(rows, ignore_index=True)
-    # fallback: usar 'volumes_edit' já no formato long
     ve = st.session_state.get("volumes_edit")
     if isinstance(ve, pd.DataFrame) and {"ano", "mes", "volume"}.issubset(ve.columns):
         sub = ve[ve["ano"] == year].copy()
@@ -325,7 +340,7 @@ def make_row_style_js() -> JsCode:
             return {{'backgroundColor':'#FFF8C5','fontWeight':'700'}};
           }}
           if ({js_list}.includes(params.data.indicador_id)){{
-            return {{'backgroundColor':'#F3F4F6','fontWeight':'600'}};
+            return {{'backgroundColor':'F3F4F6','fontWeight':'600'}};
           }}
           return null;
         }}
@@ -362,7 +377,6 @@ def main():
     # ---------------- Sidebar: Controles Globais ----------------
     with st.sidebar:
         st.header("⚙️ Controles")
-        # Toggle global de projeção (UI → YTG)
         st.session_state.setdefault(S._USE_SIM_KEY, True)
 
         st.toggle(
@@ -375,7 +389,7 @@ def main():
         escala_label = st.selectbox(
             "Escala",
             ["1x", "1.000x", "1.000.000x"],
-            index=["1x","1.000x","1.000.000x"].index(st.session_state.get(S._SCALE_LABEL_KEY, "1.000x"))  # default 1.000x
+            index=["1x","1.000x","1.000.000x"].index(st.session_state.get(S._SCALE_LABEL_KEY, "1.000x"))
         )
         st.session_state[S._SCALE_LABEL_KEY] = escala_label
         st.session_state["dre_scale_label"] = escala_label
@@ -383,7 +397,7 @@ def main():
         st.caption("• YTD vem do cenário Realizado do CURRENT.\n• YTG usa UI se marcado; caso contrário, RES_WORKING.")
 
         st.divider()
-        st.header("📁 Status dos Arquivos")
+        st.header("📁 Status dos Arquivos (Sidebar)")
         try:
             df_chk = load_current_long()
             ok_current = not df_chk.empty
@@ -403,14 +417,13 @@ def main():
     years = list_years(df)
     default_year = years[-1] if years else pd.Timestamp.today().year
 
-    # Estado inicial (sem seletor de escala no topo!)
     st.session_state.setdefault("dre_year", default_year)
 
     st.markdown("### Demonstração de Resultado (DRE) — Comparativo P&L Mensal")
 
-    # Controles COMUNS às abas (apenas calcula escala/ano)
+    # Controles COMUNS às abas
     year = st.session_state.get("dre_year") or default_year
-    escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")  # default 1.000x
+    escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")
     scale = {"1x": 1, "1.000x": 1_000, "1.000.000x": 1_000_000}[escala_label]
 
     # Cenários
@@ -423,7 +436,7 @@ def main():
     cutoff = cutoff_from_realizado(df, year)
     baseline_name = find_baseline_scenario(df, year)
 
-    # --------- PRÉ-CÁLCULOS: volumes conforme TOGGLE (sem fallback) ---------
+    # --------- PRÉ-CÁLCULOS: volumes conforme TOGGLE ---------
     use_sim = bool(st.session_state.get(S._USE_SIM_KEY, True))
     volumes_ui_long = get_volumes_from_ui_long(year) if use_sim else None
     volumes_res_df = res_volume_by_family_long() if (not use_sim) else pd.DataFrame()
@@ -440,7 +453,6 @@ def main():
     # ABA 1 — P&L MENSAL
     # ==================================================================================
     with tab1:
-        # Cenário para comparativo (KPIs)
         scen_sel = st.selectbox(
             "Cenário para comparativo",
             scens,
@@ -466,7 +478,7 @@ def main():
                 help=f"Simulado: {a:,}  |  Cenário: {b:,}".replace(",", "."),
             )
 
-        # Projeção (simulado) — usa APENAS o toggle global da lateral
+        # Simulado para KPIs (usa toggle global)
         if piv_real is not None:
             piv_table = build_simulado_pivot(
                 df=df,
@@ -474,11 +486,11 @@ def main():
                 year=year,
                 cutoff=cutoff,
                 base_calc_path=BASE_CALC_PATH,
-                volumes_edit=volumes_ui_long,      # ON: df; OFF: None
-                volumes_res=volumes_res_df,        # ON: vazio; OFF: RES df
-                volume_mode=volume_mode,           # "ui" ou "res"
+                volumes_edit=volumes_ui_long,
+                volumes_res=volumes_res_df,
+                volume_mode=volume_mode,
                 dme_pct=0.102,
-                ui_month_totals=ui_totals,         # ON: dict; OFF: None
+                ui_month_totals=ui_totals,
                 conv_source="excel",
             )
         else:
@@ -508,16 +520,20 @@ def main():
 
         st.markdown("---")
 
-        # Controles da tabela (sem toggle de projeção aqui!)
+        # Controles da tabela (sem on_change/rerun)
         ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.2, 1.0, 1.0, 1.6], gap="small")
         with ctrl1:
-            st.checkbox("Detalhado", key="show_all_rows_t1", help="Exibir todas as linhas.")
+            st.checkbox(
+                "Detalhado",
+                key="show_all_rows_t1",
+                value=bool(st.session_state.get("show_all_rows_t1", False)),
+                help="Exibir todas as linhas."
+            )
         with ctrl2:
             st.checkbox("YTD", key="show_ytd_detail_t1")
         with ctrl3:
             st.checkbox("YTG", key="show_ytg_detail_t1")
 
-        # Cenário Base da Tabela
         default_table_scen = scenario_realizado_for_year(df, year) or scens[0]
         st.selectbox(
             "Cenário Base da Tabela",
@@ -532,50 +548,85 @@ def main():
             piv_table = build_simulado_pivot(
                 df=df, piv_real=piv_table, year=year, cutoff=cutoff,
                 base_calc_path=BASE_CALC_PATH,
-                volumes_edit=volumes_ui_long,   # ON: df; OFF: None
-                volumes_res=volumes_res_df,     # ON: vazio; OFF: RES df
-                volume_mode=volume_mode,        # "ui" ou "res"
+                volumes_edit=volumes_ui_long,
+                volumes_res=volumes_res_df,
+                volume_mode=volume_mode,
                 dme_pct=0.102,
-                ui_month_totals=ui_totals,      # ON: dict; OFF: None
+                ui_month_totals=ui_totals,
                 conv_source="excel",
             )
 
-        # --- NOVO: coluna UC (absoluto) ---
-        vol_total_ano = int(piv_table.loc[piv_table["indicador_id"] == "volume_uc", "Total Ano"].sum()) if piv_table is not None else 0
-
-        # Export Excel (tabela mensal completa) — sem UC por enquanto
-        with ctrl4:
-            scen_slug = re.sub(r'[^A-Za-z0-9]+', '-', str(_short_title(st.session_state["dre_table_scen"])))
-            tag = "UI" if use_sim else "RES"
-            st.download_button(
-                "Exportar Excel (P&L mensal)",
-                data=make_excel_bytes(piv_table, sheet_name="P&L Mensal"),
-                file_name=f"DRE_{year}_{scen_slug}_{tag}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-        # Visão (todas x principais)
-        if st.session_state["show_all_rows_t1"]:
+        # --- Visão (todas x principais): só decidir UMA vez ---
+        show_all = bool(st.session_state.get("show_all_rows_t1", False))
+        if show_all:
             piv_table_view = piv_table.copy()
         else:
             keep_ids = set(BOLD_GREY_ROWS)
-            piv_table_view = piv_table[piv_table["indicador_id"].isin(keep_ids)].reset_index(drop=True)
+            piv_table_view = (
+                piv_table[piv_table["indicador_id"].isin(keep_ids)]
+                .reset_index(drop=True)
+                .copy()
+            )
 
-        # adiciona UC (absoluto, sem escala)
+        # ---- Cálculos auxiliares para UC e Totais (NÃO reatribuir piv_table_view) ----
+        vol_por_mes = {MONTHS_PT[m]: int(piv_table.loc[piv_table["indicador_id"] == "volume_uc", MONTHS_PT[m]].sum())
+                       for m in range(1,13)}
+        vol_total_ano = int(piv_table.loc[piv_table["indicador_id"] == "volume_uc", "Total Ano"].sum())
+
+        # Determina meses "visíveis" conforme toggles YTD/YTG (para Total Visão)
+        show_ytd = bool(st.session_state.get("show_ytd_detail_t1", False))
+        show_ytg = bool(st.session_state.get("show_ytg_detail_t1", False))
+        meses_visiveis: List[str] = []
+        cutoff_safe = int(cutoff) if cutoff else 0
+        if show_ytd and cutoff_safe > 0:
+            meses_visiveis += [MONTHS_PT[m] for m in range(1, cutoff_safe+1)]
+        if show_ytg and cutoff_safe < 12:
+            meses_visiveis += [MONTHS_PT[m] for m in range(cutoff_safe+1, 13)]
+        seen = set()
+        meses_visiveis = [x for x in meses_visiveis if not (x in seen or seen.add(x))]
+        vol_total_visao = int(sum(vol_por_mes.get(mc, 0) for mc in meses_visiveis)) if meses_visiveis else 0
+
+        meses_todos = [MONTHS_PT[m] for m in range(1, 13)]
+        is_subset = bool(meses_visiveis) and set(meses_visiveis) != set(meses_todos)
+        if is_subset:
+            piv_table_view["Total Visão"] = piv_table_view[meses_visiveis].sum(axis=1).astype(float)
+            if vol_total_visao > 0:
+                piv_table_view["UC (Visão)"] = (piv_table_view["Total Visão"].astype(float) / float(vol_total_visao)).fillna(0.0)
+            else:
+                piv_table_view["UC (Visão)"] = 0.0
+
+        # UC por mês
+        for mc in meses_todos:
+            vol_m = vol_por_mes.get(mc, 0)
+            uc_col = f"UC {mc}"
+            if vol_m > 0:
+                piv_table_view[uc_col] = (piv_table_view[mc].astype(float) / float(vol_m)).fillna(0.0)
+            else:
+                piv_table_view[uc_col] = 0.0
+
+        # UC (Ano)
         if vol_total_ano > 0:
-            piv_table_view["UC"] = (piv_table_view["Total Ano"] / float(vol_total_ano)).fillna(0.0)
+            piv_table_view["UC (Ano)"] = (piv_table_view["Total Ano"].astype(float) / float(vol_total_ano)).fillna(0.0)
         else:
-            piv_table_view["UC"] = 0.0
+            piv_table_view["UC (Ano)"] = 0.0
 
         # Colunas agrupadas YTD / YTG
-        ytd_cols = [v for k, v in MONTHS_PT.items() if k <= cutoff]
-        ytg_cols = [v for k, v in MONTHS_PT.items() if k > cutoff]
+        ytd_cols = [v for k, v in MONTHS_PT.items() if k <= cutoff_safe]
+        ytg_cols = [v for k, v in MONTHS_PT.items() if k > cutoff_safe]
 
         fmt = make_value_formatter(scale)
         row_style = make_row_style_js()
         on_ready, on_col_vis = on_fit_events_js()
-        fmt_abs = make_value_formatter(1)  # absoluto (sem escala)
+
+        fmt_uc = JsCode("""
+function(params){
+  var v = params.value;
+  if (v === null || v === undefined) return "-";
+  var n = Number(v);
+  if (isNaN(n)) return "-";
+  return n.toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+""")
 
         def child(col_name: str, hidden: bool = False):
             return {
@@ -587,18 +638,25 @@ def main():
                 "cellClass": "ag-right-aligned-cell",
             }
 
-        def child_uc():
+        def child_uc(col_name: str, hidden: bool = False):
             return {
-                "field": "UC",
+                "field": col_name,
                 "editable": False,
                 "type": "numericColumn",
-                "valueFormatter": fmt_abs,  # sem escala
-                "hide": False,
+                "valueFormatter": fmt_uc,
+                "hide": hidden,
                 "cellClass": "ag-right-aligned-cell",
             }
 
-        ytd_children = [child(c, hidden=(not st.session_state["show_ytd_detail_t1"])) for c in ytd_cols]
-        ytg_children = [child(c, hidden=(not st.session_state["show_ytg_detail_t1"])) for c in ytg_cols]
+        ytd_children = []
+        for c in ytd_cols:
+            ytd_children.append(child(c, hidden=(not show_ytd)))
+            ytd_children.append(child_uc(f"UC {c}", hidden=(not show_ytd)))
+
+        ytg_children = []
+        for c in ytg_cols:
+            ytg_children.append(child(c, hidden=(not show_ytg)))
+            ytg_children.append(child_uc(f"UC {c}", hidden=(not show_ytg)))
 
         column_defs = [
             {"field": "indicador_id", "hide": True},
@@ -606,12 +664,12 @@ def main():
         ]
         if ytd_children:
             column_defs.append({
-                "headerName": f"YTD (<= M{cutoff:02d})" if cutoff > 0 else "YTD",
+                "headerName": f"YTD (<= M{cutoff_safe:02d})" if cutoff_safe > 0 else "YTD",
                 "marryChildren": True, "children": ytd_children,
             })
         if ytg_children:
             column_defs.append({
-                "headerName": f"YTG (>{cutoff:02d})" if cutoff > 0 else "YTG",
+                "headerName": f"YTG (>{cutoff_safe:02d})" if cutoff_safe > 0 else "YTG",
                 "marryChildren": True, "children": ytg_children,
             })
 
@@ -620,8 +678,13 @@ def main():
             mc = MONTHS_PT[m]
             if mc not in existing:
                 column_defs.append(child(mc, hidden=True))
+                column_defs.append(child_uc(f"UC {mc}", hidden=True))
+
+        if "Total Visão" in piv_table_view.columns:
+            column_defs.append(child("Total Visão", hidden=False))
+            column_defs.append(child_uc("UC (Visão)", hidden=False))
         column_defs.append(child("Total Ano", hidden=False))
-        column_defs.append(child_uc())  # <-- NOVO: UC ao lado de Total Ano
+        column_defs.append(child_uc("UC (Ano)", hidden=False))
 
         grid_options = {
             "columnDefs": column_defs,
@@ -634,7 +697,7 @@ def main():
         }
 
         scen_slug = re.sub(r'[^A-Za-z0-9]+', '-', str(_short_title(st.session_state["dre_table_scen"])))
-        grid_key = f"dre_grid_{year}_{scen_slug}_{int(st.session_state['show_ytd_detail_t1'])}_{int(use_sim)}_{int(st.session_state['show_all_rows_t1'])}_{int(st.session_state['show_ytg_detail_t1'])}_{scale}"
+        grid_key = f"dre_grid_{year}_{scen_slug}_{int(st.session_state.get('show_ytd_detail_t1', False))}_{int(use_sim)}_{int(st.session_state.get('show_all_rows_t1', False))}_{int(st.session_state.get('show_ytg_detail_t1', False))}_{scale}"
 
         AgGrid(
             piv_table_view,
@@ -643,7 +706,6 @@ def main():
             update_mode=GridUpdateMode.NO_UPDATE,
             allow_unsafe_jscode=True,
             theme="balham",
-            height=560,
             fit_columns_on_grid_load=True,
             key=grid_key,
         )
@@ -654,18 +716,12 @@ def main():
     with tab2:
         st.markdown("#### BP25 vs Projeção")
 
-        # Controles (sem toggle aqui também)
         colf1, _ = st.columns([2, 1])
         with colf1:
-            st.checkbox(
-                "Detalhado",
-                key="show_all_rows_t2",
-                help="Exibir todas as linhas."
-            )
+            st.checkbox("Detalhado", key="show_all_rows_t2", help="Exibir todas as linhas.")
 
         bp_piv = piv_bp if piv_bp is not None else pivot_pnl_alias(df, year, baseline_name or scens[0])
 
-        # FY sempre com o mesmo critério do toggle (sem fallback)
         if piv_real is not None:
             fy_piv = build_simulado_pivot(
                 df=df,
@@ -673,8 +729,8 @@ def main():
                 year=year,
                 cutoff=cutoff,
                 base_calc_path=BASE_CALC_PATH,
-                volumes_edit=(volumes_ui_long if use_sim else None),   # ON: df; OFF: None
-                volumes_res=(res_volume_by_family_long() if (not use_sim) else pd.DataFrame()),  # ON: vazio; OFF: RES
+                volumes_edit=(volumes_ui_long if use_sim else None),
+                volumes_res=(res_volume_by_family_long() if (not use_sim) else pd.DataFrame()),
                 volume_mode=("ui" if use_sim else "res"),
                 dme_pct=0.102,
                 ui_month_totals=(ui_totals if use_sim else None),
@@ -709,47 +765,74 @@ def main():
         bp_safe = df5['BP25 (FY)'].replace({0: np.nan})
         df5['Δ %'] = ((df5['FY (YTD+YTG)'] - df5['BP25 (FY)']) / bp_safe) * 100.0
 
-        # formatação com a ESCALA da barra lateral
-        escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")  # default 1.000x
+        # -------- Tabela estilo AgGrid (sem rolagem) --------
+        escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")
         scale = {"1x": 1, "1.000x": 1_000, "1.000.000x": 1_000_000}[escala_label]
+        fmt = make_value_formatter(scale)
 
-        def _fmt_int(v):
-            if pd.isna(v): return '-'
-            try:
-                return f"{int(np.rint(v / scale)):,}".replace(',', '.')
-            except Exception:
-                return '-'
+        fmt_pct = JsCode("""
+function(params){
+  var v = params.value;
+  if (v === null || v === undefined) return "-";
+  var n = Number(v);
+  if (isNaN(n)) return "-";
+  var s = (n >= 0 ? "+" : "") + n.toLocaleString('pt-BR', {minimumFractionDigits: 1, maximumFractionDigits: 1});
+  return s + "%";
+}
+""")
 
-        def _fmt_pct(v):
-            if pd.isna(v): return '-'
-            return f"{v:+.1f}%"
+        row_style = make_row_style_js()
+        on_ready, on_col_vis = on_fit_events_js()
 
-        out5 = df5[['Indicador', 'BP25 (FY)', 'FY (YTD+YTG)', 'Δ Abs', 'Δ %']].rename(columns={'Indicador': 'Linha P&L'})
+        def col_num(field, header=None, formatter=None):
+            return {
+                "headerName": header or field,
+                "field": field,
+                "editable": False,
+                "type": "numericColumn",
+                "valueFormatter": formatter or fmt,
+                "cellClass": "ag-right-aligned-cell",
+            }
 
-        yellow_rows = df5['indicador_id'].eq('resultado_operacional').reindex(out5.index, fill_value=False).tolist()
+        df5_view = df5[['indicador_id', 'Indicador', 'BP25 (FY)', 'FY (YTD+YTG)', 'Δ Abs', 'Δ %']].rename(columns={'Indicador': 'Linha P&L'}).copy()
 
-        def _row_style(row):
-            i = row.name
-            if yellow_rows[i]:
-                return ['background-color: #FFF8C5; font-weight:700'] * len(row)
-            if df5['indicador_id'].iloc[i] in BOLD_GREY_ROWS:
-                return ['background-color: #F3F4F6; font-weight:600'] * len(row)
-            return [''] * len(row)
+        column_defs = [
+            {"field": "indicador_id", "hide": True},
+            {"headerName": "Linha P&L", "field": "Linha P&L", "pinned": "left", "editable": False},
+            col_num('BP25 (FY)'),
+            col_num('FY (YTD+YTG)'),
+            col_num('Δ Abs'),
+            col_num('Δ %', formatter=fmt_pct),
+        ]
 
-        st.dataframe(
-            out5.style
-                .format({
-                    'BP25 (FY)': _fmt_int,
-                    'FY (YTD+YTG)': _fmt_int,
-                    'Δ Abs': _fmt_int,
-                    'Δ %': _fmt_pct,
-                })
-                .apply(_row_style, axis=1),
-            use_container_width=True,
-            hide_index=True,
+        grid_options = {
+            "columnDefs": column_defs,
+            "defaultColDef": {"resizable": True, "sortable": False, "filter": False,
+                              "cellStyle": {"fontVariantNumeric": "tabular-nums"}},
+            "getRowStyle": row_style,
+            "rowHeight": 34, "suppressMovableColumns": True, "ensureDomOrder": True,
+            "onFirstDataRendered": on_ready, "onColumnVisible": on_col_vis,
+            "domLayout": "autoHeight",  # <- sem rolagem
+        }
+
+        AgGrid(
+            df5_view,
+            gridOptions=grid_options,
+            data_return_mode="AS_INPUT",
+            update_mode=GridUpdateMode.NO_UPDATE,
+            allow_unsafe_jscode=True,
+            theme="balham",
+            fit_columns_on_grid_load=True,
+            key=f"bp_vs_fy_grid_{year}_{scale}_{int(st.session_state.get('show_all_rows_t2', False))}",
         )
 
-        st.caption(f"Valores na escala **{escala_label}**. Δ% calculado sobre o BP (divide por zero exibido como “-”).")
+    # -------------------------
+    # Diagnóstico no rodapé
+    # -------------------------
+    st.divider()
+    st.markdown("#### 📁 Diagnóstico de Arquivos")
+    debug_parquet_status()
+
 
 if __name__ == "__main__":
     main()
