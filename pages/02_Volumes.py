@@ -1,7 +1,10 @@
 # pages/02_Volumes.py
 # --------------------------------------------------------------------------------------
 # Volumes — Realizado (YTD) travado a partir do CURRENT + Projeção (YTG) editável
-# a partir do RES_WORKING. Ocultar YTD, export XLSX, resumo de alterações.
+# com parser que respeita a ESCALA da página (1x/1.000x/1.000.000x) e aceita
+# deltas (+/-), multiplicação, divisão e percentuais diretamente no grid.
+# Editor exibe o valor já FORMATADO na escala (useFormatter=true).
+# Exibição SEM casas decimais em qualquer escala.
 # --------------------------------------------------------------------------------------
 
 import io
@@ -32,6 +35,7 @@ df_res = read_parquet_first_found([
     "data/parquet/res_working.parquet",
     "data/res_working.parquet",
 ])
+
 # --------------------------------------------------------------------------------------
 # Utilitários
 # --------------------------------------------------------------------------------------
@@ -51,19 +55,18 @@ class VolumeFormatter:
 
     @classmethod
     def js_value_formatter(cls, scale_factor: int) -> JsCode:
-        if scale_factor == 1:
-            fmt = "return Math.round(val).toLocaleString('pt-BR');"
-        else:
-            fmt = "return val.toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});"
+        # Exibe na escala selecionada, SEM casas decimais (inteiro arredondado)
         return JsCode(f"""
         function(params) {{
           if (params.value === null || params.value === undefined) return '';
           const val = Number(params.value) / {scale_factor};
-          {fmt}
+          return Math.round(val).toLocaleString('pt-BR');
         }}""")
 
     @classmethod
     def js_value_parser(cls, scale_factor: int) -> JsCode:
+        # Interpreta a digitação do usuário NA MESMA ESCALA exibida
+        # Suporta: número absoluto; +n / -n; +n% / -n%; *n; /n; e expressões simples.
         return JsCode(f"""
         function(params){{
           var raw = Number((params.oldValue !== undefined ? params.oldValue : params.value) || 0);
@@ -75,7 +78,9 @@ class VolumeFormatter:
             if (s === null || s === undefined) return NaN;
             s = String(s).trim();
             if (!s) return NaN;
-            if (s.indexOf(',') >= 0) s = s.replace(/\\./g,'').replace(/,/g,'.');
+            s = s.replace(/\\s+/g, '');
+            // Tratamento robusto pt-BR: SEMPRE remove '.' (milhar) e troca ',' por '.' (decimal)
+            s = s.replace(/\\./g, '').replace(/,/g, '.');
             return parseFloat(s);
           }}
 
@@ -88,7 +93,7 @@ class VolumeFormatter:
             return Math.max(0, Math.round(raw * (1 + sign * pct/100)));
           }}
 
-          // +1000  /  -250,5
+          // +1000  /  -250,5  (na escala exibida)
           m = input.match(/^([+-])\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*$/);
           if (m){{
             var sign = (m[1] === '+') ? 1 : -1;
@@ -115,7 +120,8 @@ class VolumeFormatter:
 
           // expressão livre ou número absoluto
           var expr = input;
-          if (expr.indexOf(',') >= 0) expr = expr.replace(/\\./g,'').replace(/,/g,'.');
+          // normaliza qualquer pontuação pt-BR
+          expr = expr.replace(/\\./g,'').replace(/,/g,'.');
           if (/[^0-9+\\-*/().\\s]/.test(expr)){{
             var n = brToFloat(input);
             if (!isNaN(n)) return Math.max(0, Math.round(n * SCALE));
@@ -279,7 +285,7 @@ def calc_changes(original_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.Data
     orig_long = orig_al.reset_index().melt(id_vars=["Família Comercial"], var_name="Mês", value_name="Antes")
     curr_long = curr_al.reset_index().melt(id_vars=["Família Comercial"], var_name="Mês", value_name="Depois")
 
-    df = orig_long.merge(curr_long, on=["Família Comercial", "Mês"], how="outer").fillna(0)
+    df = orig_long.merge(curr_long, on=["Família Comercial", "Mês"], how='outer').fillna(0)
     df["Δ"] = (df["Depois"] - df["Antes"]).astype(int)
     df = df.loc[df["Δ"] != 0].copy()
     df["Tipo"] = df["Δ"].apply(lambda x: "Inclusão" if x > 0 else "Retirada")
@@ -299,8 +305,10 @@ def build_coldefs_main(scale_factor: int, cutoff: int, hide_realizados: bool) ->
             "headerName": name,
             "type": ["rightAligned", "numericColumn"],
             "editable": mnum > cutoff,            # Realizado travado
-            "valueFormatter": val_fmt.js_code,
-            "valueParser": val_par.js_code,
+            "cellEditor": "agTextCellEditor",
+            "cellEditorParams": {"useFormatter": True},   # editor exibe FORMATADO
+            "valueFormatter": val_fmt.js_code,            # exibe na escala (inteiro)
+            "valueParser": val_par.js_code,               # interpreta na escala (com +, -, %, * e /)
             "sortable": True,
             "cellStyle": JsCode(
                 f"""
@@ -482,7 +490,7 @@ def main():
         if not valid["res_working_parquet"]:
             st.warning("`data/parquet/res_working.parquet` ausente — baseline YTG (RES) ficará vazia.")
 
-        escala_label = st.selectbox("Escala", options=list(VolumeFormatter.SCALE_OPTIONS.keys()), index=0)
+        escala_label = st.selectbox("Escala", options=list(VolumeFormatter.SCALE_OPTIONS.keys()), index=1)  # default 1.000x
         hide_realizados = st.checkbox("Ocultar YTD (Realizado)", value=False)
 
         st.divider()
@@ -544,19 +552,15 @@ def main():
         if "Total YTG" in current.columns:
             current = current.drop(columns=["Total YTG"])
 
-    # Cabeçalhos com totais dos grupos
+    # Cabeçalhos com totais dos grupos (inteiros na escala selecionada)
     real_months = [VolumeFormatter.MONTH_MAP[m] for m in range(1, cutoff + 1)
                    if VolumeFormatter.MONTH_MAP[m] in current.columns]
     prev_months = [VolumeFormatter.MONTH_MAP[m] for m in range(cutoff + 1, 13)
                    if VolumeFormatter.MONTH_MAP[m] in current.columns]
 
     def _fmt_total_header(val: float, scale_factor: int) -> str:
-        disp = float(val) / (scale_factor if scale_factor else 1)
-        if scale_factor == 1:
-            s = f"{int(round(disp)):,}".replace(",", ".")
-        else:
-            s = f"{disp:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return s
+        disp_int = int(round(float(val) / (scale_factor if scale_factor else 1)))
+        return f"{disp_int:,}".replace(",", ".")
 
     real_total = current[real_months].sum(numeric_only=True).sum() if real_months else 0.0
     prev_total = current[prev_months].sum(numeric_only=True).sum() if prev_months else 0.0
@@ -566,9 +570,9 @@ def main():
         if isinstance(grp, dict) and "children" in grp:
             title = grp.get("headerName", "")
             if title.startswith("Realizado"):
-                grp["headerName"] = f"{title} — {_fmt_total_header(real_total, scale)}"
+                grp["headerName"] = f"{title} — { _fmt_total_header(real_total, scale)}"
             elif title.startswith("Previsão"):
-                grp["headerName"] = f"{title} — {_fmt_total_header(prev_total, scale)}"
+                grp["headerName"] = f"{title} — { _fmt_total_header(prev_total, scale)}"
 
     # Pinned totals
     month_cols = VolumeFormatter.month_cols()
@@ -648,7 +652,7 @@ def main():
             allow_unsafe_jscode=True,
             theme="balham",
             height=360,
-            key=f"changes_grid_v{state.version()}_{st.session_state['del_clicks']}"
+            key=f"changes_grid_v{state.version()}_{st.session_state['del_clicks']}_{scale}"  # inclui escala no key
         )
 
         try:
