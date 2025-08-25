@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Dict, List, Tuple
 from io import BytesIO
 import re
 
@@ -45,8 +45,60 @@ from core.models import (
     res_volume_by_family_long,
     res_volume_total_by_month,
 )
-from core.calculator import build_simulado_pivot
+try:
+    from core.calculator import build_simulado_pivot
+except Exception:  # fallback quando executar fora do package root
+    from simulador_dre_streamlit.core.calculator import build_simulado_pivot
 import core.sim as S  # chaves de sessão globais (toggle/escala)
+
+# ---------------- Helpers locais para volumes UI (wide -> long) ----------------
+# Use a tabela oficial de meses do projeto (MONTHS_PT) para mapear cabeçalhos 'jan..dez'
+MONTHS_LOWER: Dict[str, Tuple[int, str]] = {name.lower(): (m, name) for m, name in MONTHS_PT.items()}
+FAM_COL_CAND = ["Família Comercial", "Familia Comercial", "familia_comercial", "Familia"]
+
+def _fam_col_local(df: pd.DataFrame) -> str:
+    for c in FAM_COL_CAND:
+        if c in df.columns:
+            return c
+    # fallback conservador
+    return "Família Comercial" if "Família Comercial" in df.columns else df.columns[0]
+
+def get_volumes_from_ui_long(year: int) -> Optional[pd.DataFrame]:
+    """
+    Converte st.session_state['volumes_wide'][year] (Família x Meses) para formato long:
+    colunas: [ano, mes, 'Família Comercial', volume].
+    Se não existir 'volumes_wide', tenta st.session_state['volumes_edit'].
+    Retorna None se não houver dados para o ano.
+    """
+    vw = st.session_state.get("volumes_wide")
+    if isinstance(vw, dict) and year in vw and isinstance(vw[year], pd.DataFrame):
+        dfw = vw[year].copy()
+        fam_col = _fam_col_local(dfw)
+        # mapeia possíveis variações de cabeçalho de mês (case-insensitive)
+        month_idx: Dict[int, str] = {}
+        for c in dfw.columns:
+            lc = str(c).strip().lower()
+            if lc in MONTHS_LOWER:
+                month_idx[MONTHS_LOWER[lc][0]] = c
+        rows = []
+        for m in range(1, 13):
+            col = month_idx.get(m)
+            vals = pd.to_numeric(dfw[col], errors="coerce").fillna(0.0) if col is not None else 0.0
+            row = pd.DataFrame({
+                "ano": year,
+                "mes": m,
+                "Família Comercial": dfw[fam_col].astype(str),
+                "volume": vals if hasattr(vals, "values") else [vals] * len(dfw)
+            })
+            rows.append(row)
+        return pd.concat(rows, ignore_index=True)
+    # fallback: usar 'volumes_edit' já no formato long
+    ve = st.session_state.get("volumes_edit")
+    if isinstance(ve, pd.DataFrame) and {"ano", "mes", "volume"}.issubset(ve.columns):
+        sub = ve[ve["ano"] == year].copy()
+        return sub if not sub.empty else None
+    return None
+
 
 PARQUET_PATH = Path("data/parquet/current.parquet")
 RES_WORKING_PATH = Path("data/parquet/res_working.parquet")
@@ -117,8 +169,6 @@ BOLD_GREY_ROWS = {
     "resultado_operacional",
     "ebitda",
 }
-
-MONTHS_LOWER = {name.lower(): (m, name) for m, name in MONTHS_PT.items()}
 
 # --------------------------------------------------------------------------------------
 # Helpers de cenário / carga
@@ -218,12 +268,12 @@ def pivot_pnl_alias(df: pd.DataFrame, year: int, scenario: str) -> pd.DataFrame:
 
 # ---------- UI Volumes (TOTAL MENSAL) ----------
 def _sum_by_month_from_volumes_wide(dfw: pd.DataFrame) -> Dict[int, int]:
-    col_map = {}
+    col_map: Dict[int, str] = {}
     for c in dfw.columns:
         lc = str(c).strip().lower()
         if lc in MONTHS_LOWER:
             col_map[MONTHS_LOWER[lc][0]] = c
-    totals = {}
+    totals: Dict[int, int] = {}
     for m in range(1, 13):
         col = col_map.get(m)
         if col is None:
@@ -245,7 +295,6 @@ def get_volumes_from_ui_total(year: int) -> Optional[Dict[int, int]]:
     return None
 
 def get_volumes_from_res(year: int) -> Optional[Dict[int, int]]:
-    # usa models.res_volume_total_by_month (RES_WORKING)
     d = res_volume_total_by_month(year)
     if not d:
         return None
@@ -314,16 +363,21 @@ def main():
     with st.sidebar:
         st.header("⚙️ Controles")
         # Toggle global de projeção (UI → YTG)
-        use_sim = st.toggle("Usar Projeção (UI) para YTG", value=bool(st.session_state.get(S._USE_SIM_KEY, True)))
-        st.session_state[S._USE_SIM_KEY] = use_sim
+        st.session_state.setdefault(S._USE_SIM_KEY, True)
+
+        st.toggle(
+            "Usar Projeção (UI) para YTG",
+            key=S._USE_SIM_KEY,
+            value=st.session_state[S._USE_SIM_KEY],
+        )
+        use_sim = st.session_state[S._USE_SIM_KEY]
 
         escala_label = st.selectbox(
             "Escala",
             ["1x", "1.000x", "1.000.000x"],
-            index=["1x","1.000x","1.000.000x"].index(st.session_state.get(S._SCALE_LABEL_KEY, "1x"))
+            index=["1x","1.000x","1.000.000x"].index(st.session_state.get(S._SCALE_LABEL_KEY, "1.000x"))  # default 1.000x
         )
         st.session_state[S._SCALE_LABEL_KEY] = escala_label
-        # espelha na chave antiga usada em captions/export (sem criar seletor no topo)
         st.session_state["dre_scale_label"] = escala_label
 
         st.caption("• YTD vem do cenário Realizado do CURRENT.\n• YTG usa UI se marcado; caso contrário, RES_WORKING.")
@@ -356,7 +410,7 @@ def main():
 
     # Controles COMUNS às abas (apenas calcula escala/ano)
     year = st.session_state.get("dre_year") or default_year
-    escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1x")
+    escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")  # default 1.000x
     scale = {"1x": 1, "1.000x": 1_000, "1.000.000x": 1_000_000}[escala_label]
 
     # Cenários
@@ -369,13 +423,12 @@ def main():
     cutoff = cutoff_from_realizado(df, year)
     baseline_name = find_baseline_scenario(df, year)
 
-    # Pré-cálculos: volumes UI/RES
-    volumes_ui_long = st.session_state.get("volumes_edit")
-    volumes_res_df = res_volume_by_family_long()  # baseline YTG sempre RES_WORKING
-    ui_totals = get_volumes_from_ui_total(year) if st.session_state.get(S._USE_SIM_KEY, True) else None
-    if ui_totals is None:
-        # fallback para RES quando UI não existir/estiver vazia
-        ui_totals = get_volumes_from_res(year)
+    # --------- PRÉ-CÁLCULOS: volumes conforme TOGGLE (sem fallback) ---------
+    use_sim = bool(st.session_state.get(S._USE_SIM_KEY, True))
+    volumes_ui_long = get_volumes_from_ui_long(year) if use_sim else None
+    volumes_res_df = res_volume_by_family_long() if (not use_sim) else pd.DataFrame()
+    ui_totals = get_volumes_from_ui_total(year) if use_sim else None
+    volume_mode = "ui" if use_sim else "res"
 
     piv_real = pivot_pnl_alias(df, year, scen_real) if scen_real else None
     piv_bp = pivot_pnl_alias(df, year, baseline_name) if baseline_name else None
@@ -414,36 +467,35 @@ def main():
             )
 
         # Projeção (simulado) — usa APENAS o toggle global da lateral
-        use_sim = bool(st.session_state.get(S._USE_SIM_KEY, True))
         if piv_real is not None:
-            piv_sim = build_simulado_pivot(
+            piv_table = build_simulado_pivot(
                 df=df,
                 piv_real=piv_real,
                 year=year,
                 cutoff=cutoff,
                 base_calc_path=BASE_CALC_PATH,
-                volumes_edit=(volumes_ui_long if use_sim else None),
-                volumes_res=volumes_res_df,
-                volume_mode=("ui" if use_sim else "res"),
+                volumes_edit=volumes_ui_long,      # ON: df; OFF: None
+                volumes_res=volumes_res_df,        # ON: vazio; OFF: RES df
+                volume_mode=volume_mode,           # "ui" ou "res"
                 dme_pct=0.102,
-                ui_month_totals=ui_totals,
+                ui_month_totals=ui_totals,         # ON: dict; OFF: None
                 conv_source="excel",
             )
         else:
-            piv_sim = None
+            piv_table = None
 
         with c1:
             st.markdown('<div class="sim-badge">Simulado</div>', unsafe_allow_html=True)
             kpi_card("Volume (UC)",
-                     sum_row(piv_sim, "volume_uc") if piv_sim is not None else 0,
+                     sum_row(piv_table, "volume_uc") if piv_table is not None else 0,
                      sum_row(piv_sel, "volume_uc"))
         with c2:
             kpi_card("Receita Líquida",
-                     sum_row(piv_sim, "receita_liquida") if piv_sim is not None else 0,
+                     sum_row(piv_table, "receita_liquida") if piv_table is not None else 0,
                      sum_row(piv_sel, "receita_liquida"))
         with c3:
             kpi_card("Resultado Operacional",
-                     sum_row(piv_sim, "resultado_operacional") if piv_sim is not None else 0,
+                     sum_row(piv_table, "resultado_operacional") if piv_table is not None else 0,
                      sum_row(piv_sel, "resultado_operacional"))
 
         st.markdown("""
@@ -474,25 +526,27 @@ def main():
             key="dre_table_scen"
         )
 
+        # Projeção na tabela (quando base = Realizado)
         piv_table = pivot_pnl_alias(df, year, st.session_state["dre_table_scen"])
-
-        # Aplica simulação quando base = Realizado (usa só o toggle da lateral)
         if is_realizado(st.session_state["dre_table_scen"]) and piv_real is not None:
             piv_table = build_simulado_pivot(
                 df=df, piv_real=piv_table, year=year, cutoff=cutoff,
                 base_calc_path=BASE_CALC_PATH,
-                volumes_edit=(volumes_ui_long if use_sim else None),
-                volumes_res=volumes_res_df,
-                volume_mode=("ui" if use_sim else "res"),
+                volumes_edit=volumes_ui_long,   # ON: df; OFF: None
+                volumes_res=volumes_res_df,     # ON: vazio; OFF: RES df
+                volume_mode=volume_mode,        # "ui" ou "res"
                 dme_pct=0.102,
-                ui_month_totals=(get_volumes_from_ui_total(year) if use_sim else get_volumes_from_res(year)),
+                ui_month_totals=ui_totals,      # ON: dict; OFF: None
                 conv_source="excel",
             )
 
-        # Export Excel (tabela mensal completa)
+        # --- NOVO: coluna UC (absoluto) ---
+        vol_total_ano = int(piv_table.loc[piv_table["indicador_id"] == "volume_uc", "Total Ano"].sum()) if piv_table is not None else 0
+
+        # Export Excel (tabela mensal completa) — sem UC por enquanto
         with ctrl4:
             scen_slug = re.sub(r'[^A-Za-z0-9]+', '-', str(_short_title(st.session_state["dre_table_scen"])))
-            tag = "Proj" if (is_realizado(st.session_state["dre_table_scen"]) and use_sim) else "Parquet"
+            tag = "UI" if use_sim else "RES"
             st.download_button(
                 "Exportar Excel (P&L mensal)",
                 data=make_excel_bytes(piv_table, sheet_name="P&L Mensal"),
@@ -508,6 +562,12 @@ def main():
             keep_ids = set(BOLD_GREY_ROWS)
             piv_table_view = piv_table[piv_table["indicador_id"].isin(keep_ids)].reset_index(drop=True)
 
+        # adiciona UC (absoluto, sem escala)
+        if vol_total_ano > 0:
+            piv_table_view["UC"] = (piv_table_view["Total Ano"] / float(vol_total_ano)).fillna(0.0)
+        else:
+            piv_table_view["UC"] = 0.0
+
         # Colunas agrupadas YTD / YTG
         ytd_cols = [v for k, v in MONTHS_PT.items() if k <= cutoff]
         ytg_cols = [v for k, v in MONTHS_PT.items() if k > cutoff]
@@ -515,6 +575,7 @@ def main():
         fmt = make_value_formatter(scale)
         row_style = make_row_style_js()
         on_ready, on_col_vis = on_fit_events_js()
+        fmt_abs = make_value_formatter(1)  # absoluto (sem escala)
 
         def child(col_name: str, hidden: bool = False):
             return {
@@ -523,6 +584,16 @@ def main():
                 "type": "numericColumn",
                 "valueFormatter": fmt,
                 "hide": hidden,
+                "cellClass": "ag-right-aligned-cell",
+            }
+
+        def child_uc():
+            return {
+                "field": "UC",
+                "editable": False,
+                "type": "numericColumn",
+                "valueFormatter": fmt_abs,  # sem escala
+                "hide": False,
                 "cellClass": "ag-right-aligned-cell",
             }
 
@@ -550,6 +621,7 @@ def main():
             if mc not in existing:
                 column_defs.append(child(mc, hidden=True))
         column_defs.append(child("Total Ano", hidden=False))
+        column_defs.append(child_uc())  # <-- NOVO: UC ao lado de Total Ano
 
         grid_options = {
             "columnDefs": column_defs,
@@ -593,16 +665,19 @@ def main():
 
         bp_piv = piv_bp if piv_bp is not None else pivot_pnl_alias(df, year, baseline_name or scens[0])
 
-        use_sim2 = bool(st.session_state.get(S._USE_SIM_KEY, True))
+        # FY sempre com o mesmo critério do toggle (sem fallback)
         if piv_real is not None:
             fy_piv = build_simulado_pivot(
-                df=df, piv_real=piv_real, year=year, cutoff=cutoff,
+                df=df,
+                piv_real=piv_real,
+                year=year,
+                cutoff=cutoff,
                 base_calc_path=BASE_CALC_PATH,
-                volumes_edit=(volumes_ui_long if use_sim2 else None),
-                volumes_res=volumes_res_df,
-                volume_mode=("ui" if use_sim2 else "res"),
+                volumes_edit=(volumes_ui_long if use_sim else None),   # ON: df; OFF: None
+                volumes_res=(res_volume_by_family_long() if (not use_sim) else pd.DataFrame()),  # ON: vazio; OFF: RES
+                volume_mode=("ui" if use_sim else "res"),
                 dme_pct=0.102,
-                ui_month_totals=(get_volumes_from_ui_total(year) if use_sim2 else get_volumes_from_res(year)),
+                ui_month_totals=(ui_totals if use_sim else None),
                 conv_source="excel",
             )
         else:
@@ -635,7 +710,7 @@ def main():
         df5['Δ %'] = ((df5['FY (YTD+YTG)'] - df5['BP25 (FY)']) / bp_safe) * 100.0
 
         # formatação com a ESCALA da barra lateral
-        escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1x")
+        escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")  # default 1.000x
         scale = {"1x": 1, "1.000x": 1_000, "1.000.000x": 1_000_000}[escala_label]
 
         def _fmt_int(v):
