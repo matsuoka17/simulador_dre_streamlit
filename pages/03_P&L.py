@@ -1,8 +1,9 @@
 # pages/03_DRE.py
 # --------------------------------------------------------------------------------------
-# DRE (Parquet) — 2 abas no MESMO arquivo:
+# DRE (Parquet) — 3 abas no MESMO arquivo:
 #   1) P&L Mensal (com UC por mês, UC (Visão), UC (Ano) e Total Visão quando subset)
 #   2) BP25 vs FY (YTD+YTG) — 5 colunas (Linha, BP, FY, Δ Abs, Δ %), sem barra de rolagem (autoHeight)
+#   3) RES vs UI — 5 colunas (Linha, RES, UI, Δ Abs, Δ %), comparando RES_WORKING vs UI
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -74,11 +75,13 @@ except (ImportError, ModuleNotFoundError):
 MONTHS_LOWER: Dict[str, Tuple[int, str]] = {name.lower(): (m, name) for m, name in MONTHS_PT.items()}
 FAM_COL_CAND = ["Família Comercial", "Familia Comercial", "familia_comercial", "Familia"]
 
+
 def _fam_col_local(df: pd.DataFrame) -> str:
     for c in FAM_COL_CAND:
         if c in df.columns:
             return c
     return "Família Comercial" if "Família Comercial" in df.columns else df.columns[0]
+
 
 def get_volumes_from_ui_long(year: int) -> Optional[pd.DataFrame]:
     """
@@ -185,14 +188,17 @@ BOLD_GREY_ROWS = {
     "ebitda",
 }
 
+
 # --------------------------------------------------------------------------------------
 # Helpers de cenário / carga
 # --------------------------------------------------------------------------------------
 def is_realizado(s: str) -> bool:
     return isinstance(s, str) and ("realiz" in s.lower())
 
+
 def is_bp(s: str) -> bool:
     return isinstance(s, str) and s.lower().replace(" ", "").startswith("bp")
+
 
 @st.cache_data(show_spinner=False)
 def load_parquet(_: Path) -> pd.DataFrame:
@@ -211,19 +217,23 @@ def load_parquet(_: Path) -> pd.DataFrame:
         df = df.rename(columns={fam_cols[0]: "Família Comercial"})
     return df
 
+
 def list_years(df: pd.DataFrame) -> List[int]:
     return sorted([int(x) for x in df["ano"].dropna().unique()])
+
 
 def scenarios_for_year(df: pd.DataFrame, year: int) -> List[str]:
     sc = df.loc[df["ano"] == year, "cenario"].dropna().astype(str).unique().tolist()
     sc = sorted(sc, key=lambda s: (0 if is_bp(s) else (1 if is_realizado(s) else 2), s))
     return sc
 
+
 def scenario_realizado_for_year(df: pd.DataFrame, year: int) -> Optional[str]:
     for s in scenarios_for_year(df, year):
         if is_realizado(s):
             return s
     return None
+
 
 def cutoff_from_realizado(df: pd.DataFrame, year: int) -> int:
     scen = scenario_realizado_for_year(df, year)
@@ -236,6 +246,7 @@ def cutoff_from_realizado(df: pd.DataFrame, year: int) -> int:
     nonzero = m[m != 0]
     return int(nonzero.index.max()) if not nonzero.empty else 0
 
+
 def find_baseline_scenario(df: pd.DataFrame, year: int) -> Optional[str]:
     for s in scenarios_for_year(df, year):
         if is_bp(s):
@@ -244,6 +255,7 @@ def find_baseline_scenario(df: pd.DataFrame, year: int) -> Optional[str]:
         if s.lower().replace(" ", "").startswith("re"):
             return s
     return None
+
 
 # ---------- Pivot no formato do P&L (linhas fixas de ROW_SPECS) ----------
 def pivot_pnl_alias(df: pd.DataFrame, year: int, scenario: str) -> pd.DataFrame:
@@ -262,8 +274,8 @@ def pivot_pnl_alias(df: pd.DataFrame, year: int, scenario: str) -> pd.DataFrame:
         return pd.DataFrame(rows)
 
     agg = (base.groupby(["indicador_id", "mes"], as_index=False)["valor"].sum()
-                 .pivot(index="indicador_id", columns="mes", values="valor")
-                 .reindex(columns=range(1, 13)).fillna(0.0))
+           .pivot(index="indicador_id", columns="mes", values="valor")
+           .reindex(columns=range(1, 13)).fillna(0.0))
 
     rows = []
     for display_id, source_id in ROW_SPECS:
@@ -281,6 +293,7 @@ def pivot_pnl_alias(df: pd.DataFrame, year: int, scenario: str) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     return out[["indicador_id", "Indicador", *month_cols, "Total Ano"]]
 
+
 # ---------- UI Volumes (TOTAL MENSAL) ----------
 def _sum_by_month_from_volumes_wide(dfw: pd.DataFrame) -> Dict[int, int]:
     col_map: Dict[int, str] = {}
@@ -297,6 +310,7 @@ def _sum_by_month_from_volumes_wide(dfw: pd.DataFrame) -> Dict[int, int]:
             totals[m] = int(pd.to_numeric(dfw[col], errors="coerce").fillna(0.0).sum())
     return totals
 
+
 def get_volumes_from_ui_total(year: int) -> Optional[Dict[int, int]]:
     vw = st.session_state.get("volumes_wide")
     if isinstance(vw, dict) and year in vw and isinstance(vw[year], pd.DataFrame):
@@ -309,11 +323,56 @@ def get_volumes_from_ui_total(year: int) -> Optional[Dict[int, int]]:
             return {int(m): int(g.get(m, 0.0)) for m in range(1, 13)}
     return None
 
+
 def get_volumes_from_res(year: int) -> Optional[Dict[int, int]]:
     d = res_volume_total_by_month(year)
     if not d:
         return None
     return {int(k): int(v) for k, v in d.items()}
+
+
+# --------------------------------------------------------------------------------------
+# Helper para RES Working pivot
+# --------------------------------------------------------------------------------------
+def build_res_working_pivot(df: pd.DataFrame, year: int, cutoff: int) -> pd.DataFrame:
+    """
+    Constrói pivot usando dados do RES_WORKING para comparação com UI.
+    Combina YTD (realizado) + YTG (res_working).
+    """
+    # Busca cenário realizado para YTD
+    scen_real = scenario_realizado_for_year(df, year)
+    if not scen_real:
+        return pivot_pnl_alias(df, year, find_baseline_scenario(df, year) or "")
+
+    # Dados do RES_WORKING para YTG
+    try:
+        volumes_res_df = res_volume_by_family_long()
+        res_totals = get_volumes_from_res(year)
+    except:
+        volumes_res_df = pd.DataFrame()
+        res_totals = None
+
+    # Constrói pivot usando RES_WORKING
+    piv_real = pivot_pnl_alias(df, year, scen_real)
+
+    if not volumes_res_df.empty and res_totals:
+        res_piv = build_simulado_pivot(
+            df=df,
+            piv_real=piv_real,
+            year=year,
+            cutoff=cutoff,
+            base_calc_path=BASE_CALC_PATH,
+            volumes_edit=None,  # Não usa UI
+            volumes_res=volumes_res_df,  # Usa RES_WORKING
+            volume_mode="res",
+            dme_pct=0.102,
+            ui_month_totals=res_totals,
+            conv_source="excel",
+        )
+        return res_piv
+
+    return piv_real
+
 
 # --------------------------------------------------------------------------------------
 # Estilo / exports
@@ -329,6 +388,7 @@ def make_value_formatter(scale: int) -> JsCode:
         }}
         """
     )
+
 
 def make_row_style_js() -> JsCode:
     anchors = list(BOLD_GREY_ROWS)
@@ -347,10 +407,12 @@ def make_row_style_js() -> JsCode:
         """
     )
 
+
 def on_fit_events_js() -> Tuple[JsCode, JsCode]:
     on_ready = JsCode("function(params){ params.api.sizeColumnsToFit(); }")
     on_col_vis = JsCode("function(params){ params.api.sizeColumnsToFit(); }")
     return on_ready, on_col_vis
+
 
 def _short_title(s: str) -> str:
     up = s.upper().replace(" ", "")
@@ -359,12 +421,14 @@ def _short_title(s: str) -> str:
     if "REALIZ" in up: return "Realizado"
     return s
 
+
 def make_excel_bytes(df_export: pd.DataFrame, sheet_name: str = "DRE") -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df_export.to_excel(writer, index=False, sheet_name=sheet_name)
     bio.seek(0)
     return bio.getvalue()
+
 
 # --------------------------------------------------------------------------------------
 # MAIN
@@ -389,7 +453,7 @@ def main():
         escala_label = st.selectbox(
             "Escala",
             ["1x", "1.000x", "1.000.000x"],
-            index=["1x","1.000x","1.000.000x"].index(st.session_state.get(S._SCALE_LABEL_KEY, "1.000x"))
+            index=["1x", "1.000x", "1.000.000x"].index(st.session_state.get(S._SCALE_LABEL_KEY, "1.000x"))
         )
         st.session_state[S._SCALE_LABEL_KEY] = escala_label
         st.session_state["dre_scale_label"] = escala_label
@@ -447,7 +511,7 @@ def main():
     piv_bp = pivot_pnl_alias(df, year, baseline_name) if baseline_name else None
 
     # ----------------- ABAS -----------------
-    tab1, tab2 = st.tabs(["P&L Mensal", "BP25 vs Projeção"])
+    tab1, tab2, tab3 = st.tabs(["P&L Mensal", "BP25 vs Projeção", "Passo 2 vs Projeção"])
 
     # ==================================================================================
     # ABA 1 — P&L MENSAL
@@ -456,7 +520,7 @@ def main():
         scen_sel = st.selectbox(
             "Cenário para comparativo",
             scens,
-            index=min(1, len(scens)-1) if len(scens) > 1 else 0,
+            index=min(1, len(scens) - 1) if len(scens) > 1 else 0,
             key="dre_scen_only"
         )
         piv_sel = pivot_pnl_alias(df, year, scen_sel)
@@ -466,6 +530,7 @@ def main():
             return int(row["Total Ano"].values[0]) if not row.empty else 0
 
         c1, c2, c3 = st.columns(3)
+
         def kpi_card(label: str, sim_val: float, scen_val: float):
             a = int(round(sim_val))
             b = int(round(scen_val))
@@ -570,7 +635,7 @@ def main():
 
         # ---- Cálculos auxiliares para UC e Totais (NÃO reatribuir piv_table_view) ----
         vol_por_mes = {MONTHS_PT[m]: int(piv_table.loc[piv_table["indicador_id"] == "volume_uc", MONTHS_PT[m]].sum())
-                       for m in range(1,13)}
+                       for m in range(1, 13)}
         vol_total_ano = int(piv_table.loc[piv_table["indicador_id"] == "volume_uc", "Total Ano"].sum())
 
         # Determina meses "visíveis" conforme toggles YTD/YTG (para Total Visão)
@@ -579,9 +644,9 @@ def main():
         meses_visiveis: List[str] = []
         cutoff_safe = int(cutoff) if cutoff else 0
         if show_ytd and cutoff_safe > 0:
-            meses_visiveis += [MONTHS_PT[m] for m in range(1, cutoff_safe+1)]
+            meses_visiveis += [MONTHS_PT[m] for m in range(1, cutoff_safe + 1)]
         if show_ytg and cutoff_safe < 12:
-            meses_visiveis += [MONTHS_PT[m] for m in range(cutoff_safe+1, 13)]
+            meses_visiveis += [MONTHS_PT[m] for m in range(cutoff_safe + 1, 13)]
         seen = set()
         meses_visiveis = [x for x in meses_visiveis if not (x in seen or seen.add(x))]
         vol_total_visao = int(sum(vol_por_mes.get(mc, 0) for mc in meses_visiveis)) if meses_visiveis else 0
@@ -591,7 +656,8 @@ def main():
         if is_subset:
             piv_table_view["Total Visão"] = piv_table_view[meses_visiveis].sum(axis=1).astype(float)
             if vol_total_visao > 0:
-                piv_table_view["UC (Visão)"] = (piv_table_view["Total Visão"].astype(float) / float(vol_total_visao)).fillna(0.0)
+                piv_table_view["UC (Visão)"] = (
+                            piv_table_view["Total Visão"].astype(float) / float(vol_total_visao)).fillna(0.0)
             else:
                 piv_table_view["UC (Visão)"] = 0.0
 
@@ -794,7 +860,8 @@ function(params){
                 "cellClass": "ag-right-aligned-cell",
             }
 
-        df5_view = df5[['indicador_id', 'Indicador', 'BP25 (FY)', 'FY (YTD+YTG)', 'Δ Abs', 'Δ %']].rename(columns={'Indicador': 'Linha P&L'}).copy()
+        df5_view = df5[['indicador_id', 'Indicador', 'BP25 (FY)', 'FY (YTD+YTG)', 'Δ Abs', 'Δ %']].rename(
+            columns={'Indicador': 'Linha P&L'}).copy()
 
         column_defs = [
             {"field": "indicador_id", "hide": True},
@@ -825,6 +892,141 @@ function(params){
             fit_columns_on_grid_load=True,
             key=f"bp_vs_fy_grid_{year}_{scale}_{int(st.session_state.get('show_all_rows_t2', False))}",
         )
+
+    # ==================================================================================
+    # ABA 3 — RES vs UI | 5 colunas
+    # ==================================================================================
+    with tab3:
+        st.markdown("#### RES Working vs Projeção UI")
+
+        colf1, _ = st.columns([2, 1])
+        with colf1:
+            st.checkbox("Detalhado", key="show_all_rows_t3", help="Exibir todas as linhas.")
+
+        # RES_WORKING pivot (YTD realizado + YTG res_working)
+        res_piv = build_res_working_pivot(df, year, cutoff)
+
+        # UI pivot (YTD realizado + YTG UI)
+        if piv_real is not None:
+            ui_piv = build_simulado_pivot(
+                df=df,
+                piv_real=piv_real,
+                year=year,
+                cutoff=cutoff,
+                base_calc_path=BASE_CALC_PATH,
+                volumes_edit=volumes_ui_long,  # Usa UI
+                volumes_res=pd.DataFrame(),  # Não usa RES
+                volume_mode="ui",
+                dme_pct=0.102,
+                ui_month_totals=ui_totals,
+                conv_source="excel",
+            )
+        else:
+            # Fallback se não houver dados realizados
+            ui_piv = pivot_pnl_alias(df, year, baseline_name or scens[0])
+
+        req_cols = ['indicador_id', 'Indicador', 'Total Ano']
+        res_view = res_piv[req_cols].rename(columns={'Total Ano': 'RES Working'}).copy()
+        ui_view = ui_piv[req_cols].rename(columns={'Total Ano': 'UI Projeção'}).copy()
+
+        # Combina os dataframes
+        order_ids = list(res_view['indicador_id'])
+        df_res_ui = res_view.merge(ui_view[['indicador_id', 'UI Projeção']], on='indicador_id', how='left')
+        extras = ui_view[~ui_view['indicador_id'].isin(df_res_ui['indicador_id'])]
+        if not extras.empty:
+            df_res_ui = pd.concat([df_res_ui, extras], ignore_index=True, sort=False)
+            for x in extras['indicador_id'].tolist():
+                if x not in order_ids:
+                    order_ids.append(x)
+
+        df_res_ui['__ord__'] = pd.Categorical(df_res_ui['indicador_id'], categories=order_ids, ordered=True)
+        df_res_ui = df_res_ui.sort_values('__ord__').drop(columns='__ord__')
+
+        # Filtro para linhas detalhadas
+        if not st.session_state.get("show_all_rows_t3", False):
+            keep_ids = set(BOLD_GREY_ROWS)
+            df_res_ui = df_res_ui[df_res_ui['indicador_id'].isin(keep_ids)].reset_index(drop=True)
+
+        # Cálculos de diferença
+        df_res_ui['RES Working'] = df_res_ui['RES Working'].fillna(0.0)
+        df_res_ui['UI Projeção'] = df_res_ui['UI Projeção'].fillna(0.0)
+        df_res_ui['Δ Abs'] = df_res_ui['UI Projeção'] - df_res_ui['RES Working']
+        res_safe = df_res_ui['RES Working'].replace({0: np.nan})
+        df_res_ui['Δ %'] = ((df_res_ui['UI Projeção'] - df_res_ui['RES Working']) / res_safe) * 100.0
+
+        # -------- Tabela estilo AgGrid (sem rolagem) --------
+        escala_label = st.session_state.get(S._SCALE_LABEL_KEY, "1.000x")
+        scale = {"1x": 1, "1.000x": 1_000, "1.000.000x": 1_000_000}[escala_label]
+        fmt = make_value_formatter(scale)
+
+        fmt_pct = JsCode("""
+function(params){
+  var v = params.value;
+  if (v === null || v === undefined) return "-";
+  var n = Number(v);
+  if (isNaN(n)) return "-";
+  var s = (n >= 0 ? "+" : "") + n.toLocaleString('pt-BR', {minimumFractionDigits: 1, maximumFractionDigits: 1});
+  return s + "%";
+}
+""")
+
+        row_style = make_row_style_js()
+        on_ready, on_col_vis = on_fit_events_js()
+
+        def col_num(field, header=None, formatter=None):
+            return {
+                "headerName": header or field,
+                "field": field,
+                "editable": False,
+                "type": "numericColumn",
+                "valueFormatter": formatter or fmt,
+                "cellClass": "ag-right-aligned-cell",
+            }
+
+        df_res_ui_view = df_res_ui[['indicador_id', 'Indicador', 'RES Working', 'UI Projeção', 'Δ Abs', 'Δ %']].rename(
+            columns={'Indicador': 'Linha P&L'}).copy()
+
+        column_defs = [
+            {"field": "indicador_id", "hide": True},
+            {"headerName": "Linha P&L", "field": "Linha P&L", "pinned": "left", "editable": False},
+            col_num('RES Working'),
+            col_num('UI Projeção'),
+            col_num('Δ Abs'),
+            col_num('Δ %', formatter=fmt_pct),
+        ]
+
+        grid_options = {
+            "columnDefs": column_defs,
+            "defaultColDef": {"resizable": True, "sortable": False, "filter": False,
+                              "cellStyle": {"fontVariantNumeric": "tabular-nums"}},
+            "getRowStyle": row_style,
+            "rowHeight": 34, "suppressMovableColumns": True, "ensureDomOrder": True,
+            "onFirstDataRendered": on_ready, "onColumnVisible": on_col_vis,
+            "domLayout": "autoHeight",  # <- sem rolagem
+        }
+
+        AgGrid(
+            df_res_ui_view,
+            gridOptions=grid_options,
+            data_return_mode="AS_INPUT",
+            update_mode=GridUpdateMode.NO_UPDATE,
+            allow_unsafe_jscode=True,
+            theme="balham",
+            fit_columns_on_grid_load=True,
+            key=f"res_vs_ui_grid_{year}_{scale}_{int(st.session_state.get('show_all_rows_t3', False))}",
+        )
+
+        # Adiciona informações explicativas
+        with st.expander("ℹ️ Sobre esta comparação"):
+            st.markdown("""
+            **RES Working**: Combina YTD (dados realizados) + YTG (projeção do arquivo RES_WORKING)
+
+            **UI Projeção**: Combina YTD (dados realizados) + YTG (projeção inserida manualmente na interface)
+
+            **Δ Abs**: Diferença absoluta (UI Projeção - RES Working)
+
+            **Δ %**: Diferença percentual ((UI Projeção - RES Working) / RES Working * 100)
+            """)
 
     # -------------------------
     # Diagnóstico no rodapé

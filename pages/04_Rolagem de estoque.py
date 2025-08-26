@@ -1,4 +1,4 @@
-# pages/04_Rolagem.py — Rolagem + Capacidade (NEC mínima) com auditoria
+# pages/04_Rolagem de estoque.py — Rolagem + Capacidade (NEC mínima) com auditoria
 from __future__ import annotations
 import io
 import streamlit as st
