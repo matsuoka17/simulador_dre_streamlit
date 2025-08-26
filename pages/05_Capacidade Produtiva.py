@@ -201,7 +201,6 @@ def _sales_source_long(year: int, use_ui: bool) -> pd.DataFrame:
     Fonte = UI (toggle) OU RES_WORKING.
     """
     if use_ui:
-        # da UI: st.session_state['volumes_wide'][year] (Família x meses)
         vw = st.session_state.get("volumes_wide")
         if isinstance(vw, dict) and year in vw and isinstance(vw[year], pd.DataFrame):
             w = vw[year].copy()
@@ -268,8 +267,31 @@ def _style_gap(val: float) -> str:
         return "background-color:#ecfdf5; color:#065f46"
     return ""
 
+def _style_posneg(val: float) -> str:
+    if pd.isna(val):
+        return ""
+    if val < 0:
+        return "background-color:#fde2e2; color:#991b1b"
+    if val > 0:
+        return "background-color:#ecfdf5; color:#065f46"
+    return ""
+
+# --------------------------------------------------------------------------------------
+# Gerador de rótulos "visualmente iguais / internamente únicos" para NÃO surgir "⚠"
+# --------------------------------------------------------------------------------------
+_ZW = "\u200B"  # zero-width space
+
+def make_unique_metric(metric: str, idx: int) -> str:
+    """Retorna um rótulo visualmente igual, porém único: 'Inicial' + N * ZW."""
+    # idx é o índice do mês no YTG
+    return metric + (_ZW * idx)
+
+def strip_unique_metric(metric_label: str) -> str:
+    """Remove zero-width para comparar/identificar a métrica original."""
+    return metric_label.replace(_ZW, "")
+
 # ======================================================================================
-# CÁLCULO PRINCIPAL (YTG)
+# CÁLCULO PRINCIPAL (YTG) — produção limitada à capacidade (ruptura real)
 # ======================================================================================
 
 def compute_by_technology(year: int, use_ui: bool) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], pd.DataFrame]:
@@ -320,15 +342,13 @@ def compute_by_technology(year: int, use_ui: bool) -> Tuple[Dict[str, pd.DataFra
     ei_raw = _estoque_inicial_por_familia(year)
     ei_raw = ei_raw[ei_raw.get("Ano", year) == year] if "Ano" in ei_raw.columns else ei_raw
     first_m = months[0]
-    fam_list = piv_sales["Família Comercial"].tolist()
-    ei_map = _apply_estoque_inicial(first_m, fam_list, ei_raw)
 
     # --------- por tecnologia ----------
     kpis: Dict[str, pd.DataFrame] = {}
     details: Dict[str, pd.DataFrame] = {}
+    resumo_rows: List[Dict[str, float | str]] = []
 
     tecs = sorted(piv_sales["Tecnologia"].dropna().unique().tolist())
-    resumo_rows = []
 
     for tec in tecs:
         sub = piv_sales[piv_sales["Tecnologia"] == tec].reset_index(drop=True)
@@ -341,13 +361,24 @@ def compute_by_technology(year: int, use_ui: bool) -> Tuple[Dict[str, pd.DataFra
         cap_sub = cap[cap["Tecnologia"] == tec]
         cap_row = {mc: float(pd.to_numeric(cap_sub[mc], errors="coerce").fillna(0).sum()) for mc in months_pt} if not cap_sub.empty else {mc: 0.0 for mc in months_pt}
 
-        # Detalhamento por família (MultiIndex: mês -> indicador)
-        cols = pd.MultiIndex.from_product([months_pt, ["Inicial","Produção","Vendas","Estoque"]])
+        # ---------- Detalhamento por família ----------
+        # Construímos um MultiIndex de 2 níveis: (Mês, MétricaUnica)
+        base_metrics = ["Inicial", "Produção", "Vendas", "Estoque"]
+
+        unique_metric_by_month: Dict[Tuple[str, str], str] = {}
+        tuples_cols: List[Tuple[str, str]] = []
+        for i, mc in enumerate(months_pt):
+            for m in base_metrics:
+                um = make_unique_metric(m, i)  # rótulo único (sem exibir nada a mais)
+                unique_metric_by_month[(mc, m)] = um
+                tuples_cols.append((mc, um))
+
+        cols = pd.MultiIndex.from_tuples(tuples_cols, names=["Mês", "Indicador"])
         det = pd.DataFrame(index=fams, columns=cols, data=0.0)
 
         # preencher vendas por família
-        for mc in months_pt:
-            det[(mc, "Vendas")] = pd.to_numeric(sub[mc], errors="coerce").fillna(0.0).values
+        for i, mc in enumerate(months_pt):
+            det[(mc, unique_metric_by_month[(mc, "Vendas")])] = pd.to_numeric(sub[mc], errors="coerce").fillna(0.0).values
 
         # dicionários para KPIs (somatórios por mês)
         ei_tec: Dict[str, float] = {}
@@ -361,15 +392,15 @@ def compute_by_technology(year: int, use_ui: bool) -> Tuple[Dict[str, pd.DataFra
 
             # Estoque inicial do mês por família
             if i == 0:
-                ini_fam = np.array([ei_map.get(f, 0.0) for f in fams], dtype=float)
+                ini_fam = np.array([_apply_estoque_inicial(first_m, fams, ei_raw).get(f, 0.0) for f in fams], dtype=float)
             else:
                 prevc = MONTHS_PT[months[i-1]]
-                ini_fam = det[(prevc, "Estoque")].to_numpy(dtype=float)
+                ini_fam = det[(prevc, unique_metric_by_month[(prevc, "Estoque")])].to_numpy(dtype=float)
 
-            det[(mc, "Inicial")] = ini_fam
+            det[(mc, unique_metric_by_month[(mc, "Inicial")])] = ini_fam
 
             # Necessidade por família
-            vend_fam = det[(mc, "Vendas")].to_numpy(dtype=float)
+            vend_fam = det[(mc, unique_metric_by_month[(mc, "Vendas")])].to_numpy(dtype=float)
             need_fam = np.maximum(vend_fam - ini_fam, 0.0)
             need_total = float(need_fam.sum())
             need_tec[mc] = need_total
@@ -382,10 +413,10 @@ def compute_by_technology(year: int, use_ui: bool) -> Tuple[Dict[str, pd.DataFra
             else:
                 prod_fam = np.zeros_like(need_fam)
 
-            det[(mc, "Produção")] = prod_fam
+            det[(mc, unique_metric_by_month[(mc, "Produção")])] = prod_fam
 
             # Estoque final = Inicial + Produção - Vendas  (pode ser negativo)
-            det[(mc, "Estoque")] = ini_fam + prod_fam - vend_fam
+            det[(mc, unique_metric_by_month[(mc, "Estoque")])] = ini_fam + prod_fam - vend_fam
 
             # KPIs tec
             ei_tec[mc] = float(ini_fam.sum())
@@ -511,9 +542,10 @@ def main():
                     to_drop.append(mc)
             keep_mc = [mc for mc in months_pt if mc not in to_drop]
             if keep_mc:
+                # manter a ordem original
                 cols_keep = []
                 for mc in keep_mc:
-                    cols_keep.extend([(mc, x) for x in ["Inicial","Produção","Vendas","Estoque"]])
+                    cols_keep.extend([(mc, c) for c in d.columns.get_level_values(1).unique() if (mc, c) in d.columns])
                 d = d.loc[:, cols_keep]
             else:
                 st.info("Todos os meses do YTG ficaram zerados para esta tecnologia.")
@@ -524,12 +556,10 @@ def main():
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
                 styles.loc["TOTAL", :] = "background-color:#fff3bf; font-weight:700"
                 for col in df.columns:
-                    mes, metric = col
-                    if metric in ("Inicial", "Estoque"):
-                        styles[col] = df[col].map(
-                            lambda v: "background-color:#fde2e2; color:#991b1b" if pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0] < 0
-                            else ("background-color:#ecfdf5; color:#065f46" if pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0] > 0 else "")
-                        )
+                    # identificar métrica "real" removendo zero-width
+                    metric_clean = strip_unique_metric(col[1])
+                    if metric_clean in ("Inicial", "Estoque"):
+                        styles[col] = df[col].map(lambda v: _style_posneg(float(v)) if pd.notna(v) else "")
                 return styles
 
             det_fmt = {c: (lambda x, sc=scale: _fmt_int(x, sc)) for c in d.columns}
@@ -558,24 +588,6 @@ def main():
                 use_container_width=True,
                 hide_index=True,
             )
-
-            try:
-                import altair as alt
-                melt = resumo.melt(id_vars="Tecnologia", value_vars=["Necessidade (YTG)","Capacidade (YTG)"])
-                chart = (
-                    alt.Chart(melt)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("value:Q", title=f"Unidades ({escala_label})"),
-                        y=alt.Y("Tecnologia:N", sort="-x"),
-                        color=alt.Color("variable:N", title=""),
-                        tooltip=["Tecnologia","variable","value"]
-                    )
-                    .properties(height=300)
-                )
-                st.altair_chart(chart, use_container_width=True)
-            except Exception as e:
-                log(f"ℹ️ Altair indisponível ({e}); gráfico pulado.")
 
             # Heatmap Gap por mês (com total no topo)
             try:

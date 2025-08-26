@@ -1,4 +1,4 @@
-# pages/02_Volumes.py
+# pages/02_Volume de vendas.py
 # --------------------------------------------------------------------------------------
 # Volumes — Realizado (YTD) travado a partir do CURRENT + Projeção (YTG) editável
 # com parser que respeita a ESCALA da página (1x/1.000x/1.000.000x) e aceita

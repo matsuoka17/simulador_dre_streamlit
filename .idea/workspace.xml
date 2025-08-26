@@ -5,11 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="3dd928e1-1591-4f86-8ad1-f8783cdde057" name="Changes" comment="2.0">
-      <change afterPath="$PROJECT_DIR$/pages/05_valicadao.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/estoque/estoque_inicial.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/data/estoque/estoque_inicial.xlsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pages/03_P&amp;L.py" beforeDir="false" afterPath="$PROJECT_DIR$/pages/03_P&amp;L.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pages/04_Rolagem.py" beforeDir="false" afterPath="$PROJECT_DIR$/pages/04_Rolagem de estoque.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pages/02_Volumes.py" beforeDir="false" afterPath="$PROJECT_DIR$/pages/02_Volume de vendas.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pages/05_Capacidade Produtiva.py" beforeDir="false" afterPath="$PROJECT_DIR$/pages/05_Capacidade Produtiva.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -221,7 +219,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756153120892</updated>
     </task>
-    <option name="localTasksCounter" value="12" />
+    <task id="LOCAL-00012" summary="2.0">
+      <option name="closed" value="true" />
+      <created>1756171465847</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1756171465847</updated>
+    </task>
+    <option name="localTasksCounter" value="13" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
