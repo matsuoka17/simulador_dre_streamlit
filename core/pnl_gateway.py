@@ -125,6 +125,11 @@ def _realizado_ytd_ytg_matrix(year: int, use_ui: bool) -> pd.DataFrame:
       - YTD: CURRENT (cenario_like='Realizado', exatamente como no parquet).
       - YTG: volumes do RES_WORKING (Grupo 3) OU UI (Grupo 4) se use_ui=True.
       - Linhas copiadas do RE mais recente; RB/Ins/Toll/Frete via base_calculos.xlsx (fallback escala RE).
+
+    Quando `use_ui=True`, o motor depende das funções ``core.sim.resolve_monthly_volumes``
+    (totais por mês) e ``core.sim.resolve_monthly_volumes_by_family`` (detalhe por família)
+    para montar o YTG. Caso qualquer uma das fontes esteja vazia ou indisponível, o
+    comportamento recai automaticamente no RES.
     """
     # Pivot base do Realizado (YTD)
     piv_real = M.dre_matrix_total(year=year, cenario_like="Realizado")
@@ -147,12 +152,65 @@ def _realizado_ytd_ytg_matrix(year: int, use_ui: bool) -> pd.DataFrame:
     volume_mode = "ui" if use_ui else "res"
     volumes_edit = None
     ui_month_totals = None
-    if use_ui and S and hasattr(S, "resolve_monthly_volumes"):
-        try:
-            volumes_edit, ui_month_totals = S.resolve_monthly_volumes(year)
-        except Exception as e:
-            _logger.warning("resolve_monthly_volumes falhou; caindo no RES. Erro: %s", e)
+    if use_ui and S:
+        totals_map = {}
+        fam_map = {}
+
+        if hasattr(S, "resolve_monthly_volumes"):
+            try:
+                totals_candidate = S.resolve_monthly_volumes(year)
+                if totals_candidate:
+                    converted_totals = {}
+                    for key, value in dict(totals_candidate).items():
+                        try:
+                            converted_totals[int(key)] = int(float(value))
+                        except Exception:
+                            continue
+                    if converted_totals:
+                        totals_map = {m: int(converted_totals.get(m, 0)) for m in range(1, 13)}
+            except Exception as e:
+                _logger.warning("resolve_monthly_volumes falhou; caindo no RES. Erro: %s", e)
+        else:
+            _logger.warning("resolve_monthly_volumes ausente no core.sim; caindo no RES.")
+
+        if hasattr(S, "resolve_monthly_volumes_by_family"):
+            try:
+                fam_candidate = S.resolve_monthly_volumes_by_family(year) or {}
+                if fam_candidate:
+                    records = []
+                    for (fam, mes), vol in fam_candidate.items():
+                        try:
+                            mes_int = int(mes)
+                        except Exception:
+                            continue
+                        records.append({
+                            "Família Comercial": str(fam),
+                            "ano": int(year),
+                            "mes": mes_int,
+                            "volume": float(vol) if vol is not None else 0.0,
+                        })
+                    if records:
+                        fam_map = records
+            except Exception as e:
+                _logger.warning("resolve_monthly_volumes_by_family falhou; caindo no RES. Erro: %s", e)
+        else:
+            _logger.warning("resolve_monthly_volumes_by_family ausente no core.sim; caindo no RES.")
+
+        if totals_map and fam_map:
+            ui_month_totals = totals_map
+            volumes_edit = pd.DataFrame.from_records(fam_map, columns=["Família Comercial", "ano", "mes", "volume"])
+            if volumes_edit.empty:
+                volume_mode = "res"
+                volumes_edit = None
+                ui_month_totals = None
+            else:
+                volume_mode = "ui"
+        else:
+            if totals_map or fam_map:
+                _logger.warning("Volumes da UI incompletos; caindo no RES.")
             volume_mode = "res"
+            volumes_edit = None
+            ui_month_totals = None
 
     # RES_WORKING sempre como baseline
     try:
